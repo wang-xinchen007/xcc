@@ -2,15 +2,15 @@
 
 Xray 多协议节点管理工具（**单机单用户**）。TUI 参考 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 的菜单流，能力参考 [3x-ui](https://github.com/MHSanaei/3x-ui) 的入站 / 流量 / 订阅 / 分流，全部收敛在一个 Bash 脚本里。
 
-目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+。依赖 systemd。当前版本 **2.0.0**。
+目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+。依赖 systemd。当前版本 **2.0.2**。
 
 ## 功能介绍
 
 - 状态面板：CPU / 内存 / 磁盘 / 负载 / 公网 IP / 服务状态 / Xray Stats 流量
-- 一键无域名 Reality（www.microsoft.com 伪装，TLS 1.3 + xtls-rprx-vision + fp=chrome）
+- 一键无域名 Reality（默认 `download-installer.cdn.mozilla.net` 伪装，与 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 相同 `sid=6ba85179e30d4fc2` / `fp=chrome` / `flow=xtls-rprx-vision`）
 - 协议：VLESS Reality、VLESS-WS-TLS、VMess-WS-TLS、Trojan-TLS、Shadowsocks 2022、Hysteria2
 - ACME（Let's Encrypt / acme.sh）或自签名证书
-- 通用订阅（base64 HTTP）+ 分享链接 / 二维码
+- 通用订阅（base64 HTTP）+ Clash Meta YAML 订阅 + 分享链接 / 二维码
 - 出站：SOCKS5（Shifter）、直连、Cloudflare WARP（wgcf → Xray wireguard）
 - 分流：BT 阻断、广告拦截、国内直连、域名黑名单
 - BBR 加速、SSH 端口、备份恢复、核心更新
@@ -65,7 +65,7 @@ xcc version      显示版本
 ## 使用截图（TUI 示意）
 
 ```text
-┌────────────── xcc 2.0.0  |  仅支持单用户配置 ──────────────┐
+┌────────────── xcc 2.0.2  |  仅支持单用户配置 ──────────────┐
 │ xcc 主菜单                                                 │
 │                                                            │
 │     d  状态面板 / 流量                                     │
@@ -112,15 +112,26 @@ Reality 节点创建成功后，终端会打印 VLESS 分享链接，并用 `qre
 
 ## Reality 约定
 
-- 必须安装支持 XTLS/Reality 的最新 Xray（v1.8.0+）
-- `security=reality`，`tls=1.3`
-- `flow=xtls-rprx-vision`
-- `fingerprint=chrome`
+与 v2ray-agent 的 VLESS+Reality+Vision 对齐：
+
+- 必须安装支持 XTLS/Reality 的最新 Xray
+- 服务端 `realitySettings.target`（`dest` 别名）、`minClientVer=1.8.2`、`maxTimeDiff=70000`
+- `shortIds`: `["", "6ba85179e30d4fc2"]`（可另含本节点 shortId）
+- `flow=xtls-rprx-vision`，`fingerprint=chrome`
+- sniffing 开启 `routeOnly`（避免 Reality 被 sniff 改写目标）
 - 日志：`"log": {"loglevel": "warning"}`
-- 分享链接格式：
+- 分享链接格式（参数顺序与 v2ray-agent 相同）：
 
 ```text
-vless://uuid@ip:port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=伪装域名&fp=chrome&pbk=公钥&sid=shortId#备注
+vless://uuid@ip:port?encryption=none&security=reality&type=tcp&sni=伪装域名&fp=chrome&pbk=公钥&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#备注
+```
+
+VLESS-WS / Trojan / Hysteria2 分享链接同样与 v2ray-agent 字段一致，例如：
+
+```text
+vless://uuid@ip:port?encryption=none&security=tls&type=ws&host=域名&sni=域名&fp=chrome&path=/path#备注
+trojan://密码@域名:port?peer=域名&fp=chrome&sni=域名&alpn=http/1.1#备注_Trojan
+hysteria2://密码@host:port?peer=host&insecure=0&sni=host&alpn=h3#备注
 ```
 
 ## 看门狗
@@ -170,7 +181,7 @@ A: 这是 DNS 解析失败，不是脚本坏了。常见原因：
 A: 先在 TUI 选「退出」，再执行 `xcc update`。看门狗会在更新时短暂停止。
 
 **Q: Reality 连不上？**  
-A: 确认系统时间已 NTP 同步；`dest` 应对应一个支持 TLS 1.3 / HTTP2 的目标（默认 `www.microsoft.com:443`）；客户端 SNI 与公钥、shortId 需一致。
+A: 确认系统时间已 NTP 同步；`target`/`dest` 应对应一个支持 TLS 1.3 的站点（默认 `download-installer.cdn.mozilla.net:443`，与 v2ray-agent 列表一致；Xray 26 会警告 microsoft/apple 等目标）；客户端 SNI、公钥、`sid=6ba85179e30d4fc2` 需一致。sniffing 必须 `routeOnly`。
 
 **Q: 配置修改后 Xray 被看门狗重启？**  
 A: 请走 TUI 菜单修改。脚本会暂停看门狗，语法检查通过后再恢复。
