@@ -17,7 +17,6 @@ NC='\033[0m'
 XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
 XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
 XCC_GITHUB_BRANCH="${XCC_GITHUB_BRANCH:-main}"
-XCC_RAW_BASE="https://raw.githubusercontent.com/${XCC_GITHUB_USER}/${XCC_GITHUB_REPO}/${XCC_GITHUB_BRANCH}"
 XCC_BIN="/usr/local/bin/xcc"
 XCC_DIR="/etc/xcc"
 XCC_TMP_DIR="/var/tmp/xcc"
@@ -62,13 +61,33 @@ install_curl() {
 }
 
 # 每个下载操作使用 curl -f；失败时删除不完整文件并提示重试。
+# 优先走 jsDelivr 等镜像，避免 raw.githubusercontent.com DNS 污染（curl: 6）。
+github_file_urls() {
+  local file="$1"
+  local slug="${XCC_GITHUB_USER}/${XCC_GITHUB_REPO}"
+  local branch="${XCC_GITHUB_BRANCH}"
+  printf '%s\n' \
+    "https://cdn.jsdelivr.net/gh/${slug}@${branch}/${file}" \
+    "https://fastly.jsdelivr.net/gh/${slug}@${branch}/${file}" \
+    "https://github.com/${slug}/raw/${branch}/${file}" \
+    "https://raw.gitmirror.com/${slug}/${branch}/${file}" \
+    "https://raw.githubusercontent.com/${slug}/${branch}/${file}" \
+    "https://ghproxy.net/https://raw.githubusercontent.com/${slug}/${branch}/${file}"
+}
+
 download_file() {
   local dest="$1"
-  local url="$2"
-  if ! curl -fL -A "xcc-install/1.0.0" --retry 3 --retry-delay 2 --connect-timeout 15 --max-time 180 -o "${dest}" "${url}"; then
+  local file="$2"
+  local url
+  while IFS= read -r url; do
+    [[ -n "${url}" ]] || continue
+    info "尝试下载: ${url}"
+    if curl -fL -A "xcc-install/1.0.1" --connect-timeout 8 --max-time 90 -o "${dest}" "${url}"; then
+      return 0
+    fi
     rm -f "${dest}"
-    die "下载失败，请检查网络后重试: ${url}"
-  fi
+  done < <(github_file_urls "${file}")
+  die "所有镜像均下载失败。若在国内，请改用: bash <(curl -fsSL https://cdn.jsdelivr.net/gh/${XCC_GITHUB_USER}/${XCC_GITHUB_REPO}@${XCC_GITHUB_BRANCH}/install.sh)"
 }
 
 main() {
@@ -79,14 +98,14 @@ main() {
   local os_id os_ver
   read -r os_id os_ver < <(detect_os)
   info "检测到系统: ${os_id} ${os_ver}"
-  info "目标仓库: ${XCC_RAW_BASE}"
+  info "目标仓库: ${XCC_GITHUB_USER}/${XCC_GITHUB_REPO}@${XCC_GITHUB_BRANCH}"
 
   install_curl
 
   local tmp
   tmp=$(mktemp "${XCC_TMP_DIR}/xcc-XXXXXX")
   info "正在下载 xcc 主脚本..."
-  download_file "${tmp}" "${XCC_RAW_BASE}/xcc"
+  download_file "${tmp}" "xcc"
 
   if ! grep -q '^XCC_VERSION=' "${tmp}"; then
     rm -f "${tmp}"

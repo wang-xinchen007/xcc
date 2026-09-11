@@ -21,6 +21,21 @@ Xray Reality + Hysteria 节点管理工具（**仅支持单用户配置**）。
 
 ## 安装命令
 
+国内机器经常无法解析 `raw.githubusercontent.com`（`curl: (6) Could not resolve host`）。**终端不会自动走 Windows / 浏览器代理**，请优先用 jsDelivr：
+
+```bash
+bash <(curl -fsSL https://cdn.jsdelivr.net/gh/wang-xinchen007/xcc@main/install.sh)
+```
+
+若当前终端已经配置代理，且要把 DNS 也交给代理，使用 `socks5h`（注意多一个 `h`）：
+
+```bash
+export ALL_PROXY=socks5h://127.0.0.1:10808
+bash <(curl -fsSL https://raw.githubusercontent.com/wang-xinchen007/xcc/main/install.sh)
+```
+
+GitHub 官方 raw（需本机 DNS 能解析该域名）：
+
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/wang-xinchen007/xcc/main/install.sh)
 ```
@@ -28,7 +43,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/wang-xinchen007/xcc/main/ins
 手动安装：
 
 ```bash
-curl -fL -o /usr/local/bin/xcc https://raw.githubusercontent.com/wang-xinchen007/xcc/main/xcc
+curl -fL -o /usr/local/bin/xcc https://cdn.jsdelivr.net/gh/wang-xinchen007/xcc@main/xcc
 chmod 755 /usr/local/bin/xcc
 sudo xcc run
 ```
@@ -144,6 +159,13 @@ systemd 服务使用 `StandardOutput=null` 与 `StandardError=null`，避免 jou
 所有 `apt` 命令前设置 `export DEBIAN_FRONTEND=noninteractive`。
 
 ## 常见问题
+
+**Q: `curl: (6) Could not resolve host: raw.githubusercontent.com`？**  
+A: 这是 DNS 解析失败，不是脚本坏了。常见原因：
+1. 你在 **VPS / Linux 终端**里执行，Windows 上的 Clash / v2rayN **不会**自动给这台机器用。
+2. 本机终端没走代理；GUI 系统代理通常只管浏览器。
+3. 即使用了 SOCKS，也应写 `socks5h://`（远程 DNS）。`socks5://` 仍在本地解析域名，照样报 6。
+解决：改用上面的 jsDelivr 安装命令，或在终端 `export ALL_PROXY=socks5h://127.0.0.1:端口`。
 
 **Q: 提示「请先退出 xcc 再更新」？**  
 A: 先在 TUI 选「退出」，再执行 `xcc update`。看门狗会在更新时短暂停止。

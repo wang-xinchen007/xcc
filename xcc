@@ -22,7 +22,7 @@ NC='\033[0m'
 #-------------------------------------------------------------------------------
 # 版本与仓库
 #-------------------------------------------------------------------------------
-XCC_VERSION="1.0.0"
+XCC_VERSION="1.0.1"
 XCC_CONFIG_FORMAT="1"
 XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
 XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
@@ -162,6 +162,38 @@ xcc_curl_quick() {
   local url="$1"
   shift
   curl -fL -A "xcc/${XCC_VERSION}" --connect-timeout 8 --max-time 12 "$@" "${url}"
+}
+
+# GitHub raw 在国内常 DNS 污染；按镜像顺序尝试。
+github_file_urls() {
+  local file="$1"
+  local slug="${XCC_GITHUB_SLUG}"
+  local branch="${XCC_GITHUB_BRANCH}"
+  printf '%s\n' \
+    "https://cdn.jsdelivr.net/gh/${slug}@${branch}/${file}" \
+    "https://fastly.jsdelivr.net/gh/${slug}@${branch}/${file}" \
+    "https://github.com/${slug}/raw/${branch}/${file}" \
+    "https://raw.gitmirror.com/${slug}/${branch}/${file}" \
+    "https://raw.githubusercontent.com/${slug}/${branch}/${file}" \
+    "https://ghproxy.net/https://raw.githubusercontent.com/${slug}/${branch}/${file}"
+}
+
+# 从镜像列表下载仓库文件；全部失败则删除不完整文件。
+download_github_file() {
+  local dest="$1"
+  local file="$2"
+  local url
+  init_tmp
+  while IFS= read -r url; do
+    [[ -n "${url}" ]] || continue
+    info "尝试下载: ${url}"
+    if curl -fL -A "xcc/${XCC_VERSION}" --connect-timeout 8 --max-time 90 -o "${dest}" "${url}"; then
+      return 0
+    fi
+    rm -f "${dest}"
+  done < <(github_file_urls "${file}")
+  err "所有镜像均下载失败，请检查网络或为终端配置代理（socks5h）。"
+  return 1
 }
 
 #===============================================================================
@@ -2113,10 +2145,10 @@ cmd_update() {
   if [[ -n "${others}" ]] && pgrep -f "xcc run" >/dev/null 2>&1; then
     die "请先退出 xcc 再更新"
   fi
-  info "正在从 GitHub 下载最新 xcc..."
+  info "正在从 GitHub / 镜像下载最新 xcc..."
   local tmp
   tmp=$(xcc_mktemp)
-  if ! xcc_curl "${tmp}" "${XCC_RAW_BASE}/xcc"; then
+  if ! download_github_file "${tmp}" "xcc"; then
     die "下载失败，请重试。"
   fi
   systemctl stop xcc-watchdog >/dev/null 2>&1 || true
@@ -2128,9 +2160,13 @@ cmd_update() {
 }
 
 check_remote_xcc_version() {
-  local remote
-  remote=$(xcc_curl_quick "${XCC_RAW_BASE}/xcc" 2>/dev/null \
-    | grep -m1 '^XCC_VERSION=' | cut -d= -f2 | tr -d '"')
+  local remote url
+  while IFS= read -r url; do
+    [[ -n "${url}" ]] || continue
+    remote=$(xcc_curl_quick "${url}" 2>/dev/null \
+      | grep -m1 '^XCC_VERSION=' | cut -d= -f2 | tr -d '"' || true)
+    [[ -n "${remote}" ]] && break
+  done < <(github_file_urls "xcc")
   [[ -n "${remote}" ]] || return 0
   if version_newer "${remote}" "${XCC_VERSION}"; then
     add_warning "GitHub 上有新版本 ${remote}（当前 ${XCC_VERSION}），可执行 xcc update 更新。"
@@ -2337,8 +2373,8 @@ Usage:
   xcc version      显示版本
   xcc watchdog     看门狗（由 systemd 调用，请勿手动前台运行）
 
-安装:
-  bash <(curl -fsSL ${XCC_RAW_BASE}/install.sh)
+安装（国内建议用 jsDelivr，避免 raw.githubusercontent.com DNS 污染）:
+  bash <(curl -fsSL https://cdn.jsdelivr.net/gh/${XCC_GITHUB_SLUG}@${XCC_GITHUB_BRANCH}/install.sh)
 
 EOF
 }
