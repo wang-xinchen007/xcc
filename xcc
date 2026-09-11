@@ -1,0 +1,2363 @@
+#!/usr/bin/env bash
+#===============================================================================
+#  xcc - Xray / Hysteria 节点管理工具
+#  Author : xcc
+#  Version: 1.0.0
+#  Description: 单用户 Reality + Hysteria 节点管理（中文 TUI）
+#               仅支持单用户配置。目标系统：Ubuntu 24.04+ / Debian 12+ / CentOS 9+
+#===============================================================================
+
+# 不使用 set -e：whiptail/dialog 取消操作会返回非零，导致脚本误退出。
+set -uo pipefail
+
+#-------------------------------------------------------------------------------
+# 颜色（统一在脚本开头定义）
+#-------------------------------------------------------------------------------
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+#-------------------------------------------------------------------------------
+# 版本与仓库
+#-------------------------------------------------------------------------------
+XCC_VERSION="1.0.0"
+XCC_CONFIG_FORMAT="1"
+XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
+XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
+XCC_GITHUB_BRANCH="${XCC_GITHUB_BRANCH:-main}"
+XCC_GITHUB_SLUG="${XCC_GITHUB_USER}/${XCC_GITHUB_REPO}"
+XCC_RAW_BASE="https://raw.githubusercontent.com/${XCC_GITHUB_SLUG}/${XCC_GITHUB_BRANCH}"
+XCC_BACKTITLE="xcc ${XCC_VERSION}  |  仅支持单用户配置"
+
+#-------------------------------------------------------------------------------
+# 路径常量
+#-------------------------------------------------------------------------------
+XCC_BIN="/usr/local/bin/xcc"
+XCC_DIR="/etc/xcc"
+XCC_NODES="${XCC_DIR}/nodes.json"
+XCC_OUTBOUND="${XCC_DIR}/outbound.conf"
+XCC_VERSION_FILE="${XCC_DIR}/version"
+XCC_BACKUP_DIR="${XCC_DIR}/.backup"
+XCC_LOG="/var/log/xcc.log"
+XCC_TMP_DIR="/var/tmp/xcc"
+XCC_CACHE_DIR="${HOME}/.cache/xcc"
+XRAY_BIN="/usr/local/bin/xray"
+XRAY_CONF="/usr/local/etc/xray/config.json"
+HYSTERIA_BIN="/usr/local/bin/hysteria"
+HYSTERIA_DIR="/etc/hysteria"
+HYSTERIA_CONF="${HYSTERIA_DIR}/config.json"
+WATCHDOG_HALT="${XCC_DIR}/.watchdog-halt"
+WATCHDOG_RESTARTS="${XCC_DIR}/.watchdog-restarts"
+LOGROTATE_CONF="/etc/logrotate.d/xcc"
+WATCHDOG_UNIT="/etc/systemd/system/xcc-watchdog.service"
+HYSTERIA_UNIT="/etc/systemd/system/hysteria@.service"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+
+XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
+XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
+HYSTERIA_RELEASE_API="https://api.github.com/repos/apernet/hysteria/releases/latest"
+IPIFY_URL="https://api.ipify.org"
+
+#-------------------------------------------------------------------------------
+# 运行时状态
+#-------------------------------------------------------------------------------
+TUI_BACKEND="cli"
+OS_ID=""
+OS_VERSION_ID=""
+PKG_MGR=""
+IN_CONFIG_OP=0
+WATCHDOG_PAUSED=0
+CURRENT_BACKUP=""
+WARNINGS=()
+
+#===============================================================================
+# 基础输出
+#===============================================================================
+
+info()  { printf '%b[INFO]%b %s\n' "${GREEN}" "${NC}" "$*"; }
+warn()  { printf '%b[WARN]%b %s\n' "${YELLOW}" "${NC}" "$*"; }
+err()   { printf '%b[ERROR]%b %s\n' "${RED}" "${NC}" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+
+add_warning() {
+  WARNINGS+=("$1")
+  warn "$1"
+}
+
+need_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "请使用 root 用户运行 xcc（例如: sudo xcc run）"
+  fi
+}
+
+#===============================================================================
+# 日志（看门狗与主脚本共用）
+# 每次写入前检查体积，超过 50MB 则自行轮转。
+#===============================================================================
+rotate_xcc_log_if_needed() {
+  local size
+  if [[ -f "${XCC_LOG}" ]]; then
+    size=$(wc -c < "${XCC_LOG}" 2>/dev/null | tr -d ' ' || echo 0)
+    if [[ "${size}" -gt 52428800 ]]; then
+      mv "${XCC_LOG}" "${XCC_LOG}.old" 2>/dev/null || true
+      : > "${XCC_LOG}"
+    fi
+  fi
+}
+
+xcc_log() {
+  local level="$1"
+  shift
+  local ts
+  ts=$(date '+%Y-%m-%d %H:%M:%S')
+  mkdir -p "$(dirname "${XCC_LOG}")"
+  rotate_xcc_log_if_needed
+  printf '%s [%s] %s\n' "${ts}" "${level}" "$*" >> "${XCC_LOG}"
+}
+
+broadcast() {
+  if command -v wall >/dev/null 2>&1; then
+    printf '%s\n' "$*" | wall 2>/dev/null || true
+  fi
+}
+
+#===============================================================================
+# 临时文件（避免 /tmp 可能挂载为 noexec）
+#===============================================================================
+init_tmp() {
+  mkdir -p "${XCC_TMP_DIR}" "${XCC_CACHE_DIR}"
+  chmod 700 "${XCC_TMP_DIR}" 2>/dev/null || true
+}
+
+xcc_mktemp() {
+  init_tmp
+  mktemp "${XCC_TMP_DIR}/xcc-XXXXXX"
+}
+
+# 使用 curl -f；失败时删除不完整文件并提示重试。
+xcc_curl() {
+  local dest="$1"
+  local url="$2"
+  shift 2
+  init_tmp
+  if ! curl -fL -A "xcc/${XCC_VERSION}" --retry 3 --retry-delay 2 \
+      --connect-timeout 15 --max-time 180 "$@" -o "${dest}" "${url}"; then
+    rm -f "${dest}"
+    err "下载失败，请检查网络后重试: ${url}"
+    return 1
+  fi
+  return 0
+}
+
+xcc_curl_stdout() {
+  local url="$1"
+  shift
+  curl -fL -A "xcc/${XCC_VERSION}" --retry 3 --retry-delay 2 \
+    --connect-timeout 15 --max-time 60 "$@" "${url}"
+}
+
+xcc_curl_quick() {
+  local url="$1"
+  shift
+  curl -fL -A "xcc/${XCC_VERSION}" --connect-timeout 8 --max-time 12 "$@" "${url}"
+}
+
+#===============================================================================
+# 系统检测与依赖安装
+# 严格顺序：先装依赖 → 再 curl 下载官方脚本 → 最后执行安装。
+#===============================================================================
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION_ID="${VERSION_ID:-0}"
+  else
+    OS_ID="unknown"
+    OS_VERSION_ID="0"
+  fi
+
+  if command -v apt-get >/dev/null 2>&1; then
+    PKG_MGR="apt"
+  elif command -v dnf >/dev/null 2>&1; then
+    PKG_MGR="dnf"
+  elif command -v yum >/dev/null 2>&1; then
+    PKG_MGR="yum"
+  else
+    PKG_MGR="unknown"
+  fi
+}
+
+os_major() {
+  printf '%s' "${OS_VERSION_ID%%.*}"
+}
+
+check_os_support() {
+  local major
+  major=$(os_major)
+  case "${OS_ID}" in
+    ubuntu)
+      if [[ "${major}" -lt 24 ]]; then
+        add_warning "当前 Ubuntu ${OS_VERSION_ID} 低于推荐版本 24.04，部分适配可能不可用。"
+      fi
+      ;;
+    debian)
+      if [[ "${major}" -lt 12 ]]; then
+        add_warning "当前 Debian ${OS_VERSION_ID} 低于推荐版本 12。"
+      fi
+      ;;
+    centos|rhel|rocky|almalinux|fedora)
+      if [[ "${OS_ID}" != "fedora" && "${major}" -lt 9 ]]; then
+        add_warning "当前 ${OS_ID} ${OS_VERSION_ID} 低于推荐版本 9。"
+      fi
+      ;;
+    *)
+      add_warning "未识别的发行版 ${OS_ID}，将尝试继续安装。"
+      ;;
+  esac
+}
+
+# 所有 apt 操作前统一设置非交互，避免卡住 TUI。
+apt_noninteractive() {
+  export DEBIAN_FRONTEND=noninteractive
+  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a "$@"
+}
+
+pkg_update() {
+  case "${PKG_MGR}" in
+    apt) apt_noninteractive apt-get update -y ;;
+    dnf) dnf makecache -y ;;
+    yum) yum makecache -y ;;
+    *) return 1 ;;
+  esac
+}
+
+pkg_install() {
+  [[ "$#" -eq 0 ]] && return 0
+  case "${PKG_MGR}" in
+    apt) apt_noninteractive apt-get install -y "$@" ;;
+    dnf) dnf install -y "$@" ;;
+    yum) yum install -y "$@" ;;
+    *)
+      err "无法识别包管理器，请手动安装: $*"
+      return 1
+      ;;
+  esac
+}
+
+ensure_locale() {
+  if [[ -z "${LANG:-}" || "${LANG}" == "C" || "${LANG}" == "POSIX" ]]; then
+    export LANG=C.UTF-8
+    export LC_ALL=C.UTF-8
+  fi
+}
+
+# 安装 curl/jq/unzip/bc/dialog/qrencode 等依赖。
+ensure_deps() {
+  local pkgs=()
+  local missing=()
+  local p
+
+  detect_os
+
+  pkgs=(curl jq unzip bc openssl ca-certificates)
+  if [[ "${PKG_MGR}" == "apt" ]]; then
+    pkgs+=(dialog qrencode whiptail apparmor-utils)
+  else
+    pkgs+=(dialog qrencode newt)
+  fi
+
+  for p in "${pkgs[@]}"; do
+    case "${p}" in
+      whiptail|newt)
+        if ! command -v whiptail >/dev/null 2>&1; then
+          missing+=("${p}")
+        fi
+        ;;
+      dialog)
+        if ! command -v dialog >/dev/null 2>&1 && ! command -v whiptail >/dev/null 2>&1; then
+          missing+=("${p}")
+        fi
+        ;;
+      qrencode)
+        command -v qrencode >/dev/null 2>&1 || missing+=("${p}")
+        ;;
+      apparmor-utils)
+        if [[ "${OS_ID}" == "ubuntu" || "${OS_ID}" == "debian" ]]; then
+          command -v aa-complain >/dev/null 2>&1 || missing+=("${p}")
+        fi
+        ;;
+      ca-certificates)
+        if [[ ! -f /etc/ssl/certs/ca-certificates.crt && ! -f /etc/pki/tls/certs/ca-bundle.crt ]]; then
+          missing+=("${p}")
+        fi
+        ;;
+      *)
+        command -v "${p}" >/dev/null 2>&1 || missing+=("${p}")
+        ;;
+    esac
+  done
+
+  if ! command -v ss >/dev/null 2>&1; then
+    if [[ "${PKG_MGR}" == "apt" ]]; then
+      missing+=(iproute2)
+    else
+      missing+=(iproute)
+    fi
+  fi
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    info "正在安装依赖: ${missing[*]}"
+    pkg_update || warn "软件源更新失败，将继续尝试安装依赖。"
+    pkg_install "${missing[@]}" || warn "部分依赖安装失败，稍后将尝试降级交互模式。"
+  fi
+
+  # TUI fallback：whiptail → dialog → 自动安装 whiptail → 纯命令行
+  if ! command -v whiptail >/dev/null 2>&1 && ! command -v dialog >/dev/null 2>&1; then
+    info "未检测到 whiptail/dialog，正在安装 whiptail..."
+    if [[ "${PKG_MGR}" == "apt" ]]; then
+      pkg_install whiptail || true
+    else
+      pkg_install newt || true
+    fi
+  fi
+}
+
+# TUI 后端检测顺序：whiptail → dialog → 纯命令行
+tui_init() {
+  if [[ ! -t 0 || ! -t 1 ]]; then
+    TUI_BACKEND="cli"
+    warn "当前不是交互式终端，已切换为命令行模式。"
+    return
+  fi
+  if command -v whiptail >/dev/null 2>&1; then
+    TUI_BACKEND="whiptail"
+  elif command -v dialog >/dev/null 2>&1; then
+    TUI_BACKEND="dialog"
+  else
+    TUI_BACKEND="cli"
+    warn "whiptail/dialog 均不可用，已降级为纯命令行交互。"
+  fi
+}
+
+#===============================================================================
+# TUI 封装（支持回车使用默认值）
+#===============================================================================
+tui_menu() {
+  local title="$1"
+  local text="$2"
+  shift 2
+  local choice=""
+  case "${TUI_BACKEND}" in
+    whiptail)
+      choice=$(whiptail --backtitle "${XCC_BACKTITLE}" --title "${title}" \
+        --menu "${text}" 22 78 12 "$@" 3>&1 1>&2 2>&3) || return 1
+      ;;
+    dialog)
+      choice=$(dialog --backtitle "${XCC_BACKTITLE}" --title "${title}" \
+        --menu "${text}" 22 78 12 "$@" 3>&1 1>&2 2>&3) || return 1
+      clear
+      ;;
+    cli)
+      local key val
+      echo
+      printf '%b== %s ==%b\n' "${BLUE}" "${title}" "${NC}"
+      echo "${text}"
+      while [[ $# -ge 2 ]]; do
+        key="$1"; val="$2"; shift 2
+        printf "  %s) %s\n" "${key}" "${val}"
+      done
+      read -r -p "请选择: " choice || return 1
+      ;;
+  esac
+  printf '%s' "${choice}"
+}
+
+tui_input() {
+  local title="$1"
+  local text="$2"
+  local default="${3:-}"
+  local result=""
+  case "${TUI_BACKEND}" in
+    whiptail)
+      result=$(whiptail --backtitle "${XCC_BACKTITLE}" --title "${title}" \
+        --inputbox "${text}" 12 78 "${default}" 3>&1 1>&2 2>&3) || return 1
+      ;;
+    dialog)
+      result=$(dialog --backtitle "${XCC_BACKTITLE}" --title "${title}" \
+        --inputbox "${text}" 12 78 "${default}" 3>&1 1>&2 2>&3) || return 1
+      clear
+      ;;
+    cli)
+      echo
+      printf '%b== %s ==%b\n' "${BLUE}" "${title}" "${NC}"
+      if [[ -n "${default}" ]]; then
+        read -r -p "${text} [${default}]: " result || return 1
+      else
+        read -r -p "${text}: " result || return 1
+      fi
+      ;;
+  esac
+  if [[ -z "${result}" && -n "${default}" ]]; then
+    result="${default}"
+  fi
+  printf '%s' "${result}"
+}
+
+tui_password() {
+  local title="$1"
+  local text="$2"
+  local default="${3:-}"
+  local result=""
+  case "${TUI_BACKEND}" in
+    whiptail)
+      result=$(whiptail --backtitle "${XCC_BACKTITLE}" --title "${title}" \
+        --passwordbox "${text}" 12 78 "${default}" 3>&1 1>&2 2>&3) || return 1
+      ;;
+    dialog)
+      result=$(dialog --backtitle "${XCC_BACKTITLE}" --title "${title}" \
+        --passwordbox "${text}" 12 78 "${default}" 3>&1 1>&2 2>&3) || return 1
+      clear
+      ;;
+    cli)
+      echo
+      read -r -s -p "${text}: " result || return 1
+      echo
+      ;;
+  esac
+  if [[ -z "${result}" && -n "${default}" ]]; then
+    result="${default}"
+  fi
+  printf '%s' "${result}"
+}
+
+tui_yesno() {
+  local title="$1"
+  local text="$2"
+  case "${TUI_BACKEND}" in
+    whiptail)
+      whiptail --backtitle "${XCC_BACKTITLE}" --title "${title}" --yesno "${text}" 12 78
+      ;;
+    dialog)
+      dialog --backtitle "${XCC_BACKTITLE}" --title "${title}" --yesno "${text}" 12 78
+      local rc=$?
+      clear
+      return "${rc}"
+      ;;
+    cli)
+      local ans
+      read -r -p "${text} [y/N]: " ans || return 1
+      [[ "${ans}" == "y" || "${ans}" == "Y" || "${ans}" == "yes" ]]
+      ;;
+  esac
+}
+
+tui_msg() {
+  local title="$1"
+  local text="$2"
+  case "${TUI_BACKEND}" in
+    whiptail)
+      whiptail --backtitle "${XCC_BACKTITLE}" --title "${title}" --msgbox "${text}" 16 78 || true
+      ;;
+    dialog)
+      dialog --backtitle "${XCC_BACKTITLE}" --title "${title}" --msgbox "${text}" 16 78 || true
+      clear
+      ;;
+    cli)
+      echo
+      printf '%b== %s ==%b\n%s\n' "${BLUE}" "${title}" "${NC}" "${text}"
+      read -r -p "按回车继续..." _ || true
+      ;;
+  esac
+}
+
+tui_infobox() {
+  local text="$1"
+  case "${TUI_BACKEND}" in
+    whiptail)
+      whiptail --backtitle "${XCC_BACKTITLE}" --title "xcc" --infobox "${text}" 8 78
+      sleep 1
+      ;;
+    dialog)
+      dialog --backtitle "${XCC_BACKTITLE}" --title "xcc" --infobox "${text}" 8 78
+      sleep 1
+      clear
+      ;;
+    cli)
+      echo "${text}"
+      sleep 1
+      ;;
+  esac
+}
+
+tui_textbox_file() {
+  local title="$1"
+  local file="$2"
+  case "${TUI_BACKEND}" in
+    whiptail)
+      whiptail --backtitle "${XCC_BACKTITLE}" --title "${title}" --textbox "${file}" 20 78 || true
+      ;;
+    dialog)
+      dialog --backtitle "${XCC_BACKTITLE}" --title "${title}" --textbox "${file}" 20 78 || true
+      clear
+      ;;
+    cli)
+      echo
+      cat "${file}"
+      read -r -p "按回车继续..." _ || true
+      ;;
+  esac
+}
+
+#===============================================================================
+# Ubuntu 24.04+ 环境适配检测
+#===============================================================================
+is_svc_active() {
+  systemctl is-active --quiet "$1" 2>/dev/null
+}
+
+# NTP 时间同步：未同步则自动开启。
+check_ntp() {
+  if ! command -v timedatectl >/dev/null 2>&1; then
+    return 0
+  fi
+  local status
+  status=$(timedatectl status 2>/dev/null || true)
+  if ! printf '%s' "${status}" | grep -Eqi 'NTP synchronized: yes|System clock synchronized: yes'; then
+    info "NTP 未同步，正在执行 timedatectl set-ntp true"
+    timedatectl set-ntp true 2>/dev/null || warn "无法启用 NTP，Reality/TLS 可能因时间偏差失败。"
+  fi
+}
+
+# cloud-init 可能重置防火墙规则。
+check_cloud_init() {
+  if [[ -f /etc/cloud/cloud.cfg ]]; then
+    add_warning "cloud-init 可能重置防火墙规则，建议创建 /etc/cloud/cloud.cfg.d/99_disable_network.cfg 禁用网络管理。"
+  fi
+}
+
+# NetworkManager 可能干扰服务器网络配置。
+check_network_manager() {
+  if is_svc_active NetworkManager; then
+    add_warning "NetworkManager 可能干扰网络配置，建议在纯服务器环境中禁用。"
+  fi
+}
+
+# unattended-upgrades 可能自动重启服务。
+check_unattended_upgrades() {
+  if is_svc_active unattended-upgrades; then
+    add_warning "自动更新可能重启服务，建议手动配置排除 Xray。"
+  fi
+}
+
+# 旧版包管理器 Xray 残留（/etc/xray/）。
+check_legacy_xray_pkg() {
+  if [[ -d /etc/xray ]]; then
+    add_warning "检测到包管理器安装的旧版 Xray（apt install xray），建议执行 apt purge xray -y 后再继续。"
+    if [[ -t 0 ]]; then
+      if tui_yesno "旧版 Xray" "检测到 /etc/xray/，是否现在执行 apt purge xray -y？"; then
+        if [[ "${PKG_MGR}" == "apt" ]]; then
+          apt_noninteractive apt-get purge -y xray || true
+        fi
+      fi
+    fi
+  fi
+}
+
+# AppArmor 拒绝记录自动降为 complain。
+check_apparmor_xray() {
+  if [[ ! -f /var/log/syslog ]]; then
+    return 0
+  fi
+  if grep -qi "apparmor.*denied.*xray" /var/log/syslog 2>/dev/null; then
+    warn "检测到 AppArmor 拒绝 Xray，正在执行 aa-complain。"
+    command -v aa-complain >/dev/null 2>&1 || pkg_install apparmor-utils || true
+    aa-complain /usr/local/bin/xray 2>/dev/null || true
+  fi
+}
+
+dns_servers_json() {
+  if is_svc_active systemd-resolved; then
+    printf '%s' '["https://1.1.1.1/dns-query","tcp://1.1.1.1:53"]'
+  else
+    printf '%s' '["1.1.1.1","8.8.8.8"]'
+  fi
+}
+
+#===============================================================================
+# 防火墙：nftables → ufw → firewalld → iptables
+#===============================================================================
+fw_kind() {
+  if is_svc_active nftables; then
+    printf 'nftables'
+    return
+  fi
+  if command -v ufw >/dev/null 2>&1; then
+    local st
+    st=$(ufw status 2>/dev/null | head -n1 || true)
+    if printf '%s' "${st}" | grep -qi 'active'; then
+      printf 'ufw'
+      return
+    fi
+  fi
+  if is_svc_active firewalld; then
+    printf 'firewalld'
+    return
+  fi
+  if command -v iptables >/dev/null 2>&1; then
+    printf 'iptables'
+    return
+  fi
+  printf 'none'
+}
+
+# 放行 TCP 端口；ufw inactive 时跳过 ufw。
+fw_allow_tcp() {
+  local port="$1"
+  local kind
+  kind=$(fw_kind)
+  case "${kind}" in
+    nftables)
+      nft add table inet filter 2>/dev/null || true
+      nft 'add chain inet filter input { type filter hook input priority 0; }' 2>/dev/null || true
+      if nft add rule inet filter input tcp dport "${port}" accept 2>/dev/null; then
+        nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+        info "nftables 已放行 TCP ${port}"
+      else
+        warn "nftables 放行 TCP ${port} 失败，请手动放行。"
+      fi
+      ;;
+    ufw)
+      ufw allow "${port}/tcp" >/dev/null
+      ufw reload >/dev/null || true
+      info "ufw 已放行 TCP ${port}"
+      ;;
+    firewalld)
+      firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null
+      firewall-cmd --reload >/dev/null
+      info "firewalld 已放行 TCP ${port}"
+      ;;
+    iptables)
+      iptables -I INPUT -p tcp --dport "${port}" -j ACCEPT
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+      info "iptables 已放行 TCP ${port}"
+      ;;
+    *)
+      warn "未检测到防火墙，请手动放行端口 ${port}"
+      ;;
+  esac
+}
+
+fw_allow_udp() {
+  local port="$1"
+  local kind
+  kind=$(fw_kind)
+  case "${kind}" in
+    nftables)
+      nft add table inet filter 2>/dev/null || true
+      nft 'add chain inet filter input { type filter hook input priority 0; }' 2>/dev/null || true
+      nft add rule inet filter input udp dport "${port}" accept 2>/dev/null || true
+      nft list ruleset > /etc/nftables.conf 2>/dev/null || true
+      ;;
+    ufw)
+      ufw allow "${port}/udp" >/dev/null
+      ufw reload >/dev/null || true
+      ;;
+    firewalld)
+      firewall-cmd --permanent --add-port="${port}/udp" >/dev/null
+      firewall-cmd --reload >/dev/null
+      ;;
+    iptables)
+      iptables -I INPUT -p udp --dport "${port}" -j ACCEPT
+      mkdir -p /etc/iptables
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+      ;;
+    *)
+      warn "未检测到防火墙，请手动放行 UDP 端口 ${port}"
+      ;;
+  esac
+}
+
+fw_delete_tcp() {
+  local port="$1"
+  local kind
+  kind=$(fw_kind)
+  case "${kind}" in
+    ufw)
+      ufw delete allow "${port}/tcp" >/dev/null 2>&1 || true
+      ufw reload >/dev/null || true
+      ;;
+    firewalld)
+      firewall-cmd --permanent --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+      ;;
+    iptables)
+      iptables -D INPUT -p tcp --dport "${port}" -j ACCEPT 2>/dev/null || true
+      iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+      ;;
+    nftables)
+      warn "nftables 删除规则需手动处理（请用 nft -a list ruleset 查找 handle）。"
+      ;;
+  esac
+}
+
+#===============================================================================
+# 目录、版本、节点 JSON
+#===============================================================================
+ensure_dirs() {
+  mkdir -p "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${HYSTERIA_DIR}" \
+    "$(dirname "${XRAY_CONF}")" "${XCC_TMP_DIR}" "${XCC_CACHE_DIR}"
+  chmod 700 "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${HYSTERIA_DIR}"
+  if [[ ! -f "${XCC_NODES}" ]]; then
+    printf '%s\n' '{"reality":[],"hysteria":[]}' > "${XCC_NODES}"
+    chmod 600 "${XCC_NODES}"
+  fi
+  if [[ ! -f "${XCC_VERSION_FILE}" ]]; then
+    printf '%s\n' "${XCC_CONFIG_FORMAT}" > "${XCC_VERSION_FILE}"
+  fi
+  if [[ ! -f "${XRAY_CONF}" ]]; then
+    printf '%s\n' '{"inbounds":[]}' > "${XRAY_CONF}"
+    chmod 600 "${XRAY_CONF}"
+  fi
+}
+
+check_config_format() {
+  local ver
+  ver=$(tr -d ' \n' < "${XCC_VERSION_FILE}" 2>/dev/null || echo "")
+  if [[ -n "${ver}" && "${ver}" != "${XCC_CONFIG_FORMAT}" ]]; then
+    add_warning "配置格式已变更，建议重新配置。"
+  fi
+}
+
+jq_file() {
+  local file="$1"
+  local expr="$2"
+  local tmp
+  tmp=$(xcc_mktemp)
+  if jq "${expr}" "${file}" > "${tmp}"; then
+    mv "${tmp}" "${file}"
+    chmod 600 "${file}"
+    return 0
+  fi
+  rm -f "${tmp}"
+  return 1
+}
+
+# 若 config.json 不存在 inbounds 字段，先创建空数组再追加。
+ensure_xray_inbounds_array() {
+  mkdir -p "$(dirname "${XRAY_CONF}")"
+  if [[ ! -s "${XRAY_CONF}" ]] || ! jq empty "${XRAY_CONF}" 2>/dev/null; then
+    printf '%s\n' '{"inbounds":[]}' > "${XRAY_CONF}"
+    chmod 600 "${XRAY_CONF}"
+    return
+  fi
+  if ! jq -e '.inbounds' "${XRAY_CONF}" >/dev/null 2>&1; then
+    jq_file "${XRAY_CONF}" '. + {inbounds: []}' || {
+      printf '%s\n' '{"inbounds":[]}' > "${XRAY_CONF}"
+      chmod 600 "${XRAY_CONF}"
+    }
+  fi
+}
+
+#===============================================================================
+# 看门狗暂停 / 恢复（配置修改期间自动执行）
+#===============================================================================
+pause_watchdog() {
+  if is_svc_active xcc-watchdog; then
+    systemctl stop xcc-watchdog
+    WATCHDOG_PAUSED=1
+    tui_infobox "⏸ 看门狗已暂停，配置修改期间不会自动重启 Xray"
+    xcc_log INFO "看门狗已暂停（配置修改）"
+  else
+    WATCHDOG_PAUSED=0
+  fi
+}
+
+resume_watchdog() {
+  if [[ "${WATCHDOG_PAUSED}" -eq 1 ]]; then
+    systemctl start xcc-watchdog 2>/dev/null || true
+    WATCHDOG_PAUSED=0
+    tui_infobox "▶ 看门狗已恢复运行"
+    xcc_log INFO "看门狗已恢复运行"
+  fi
+}
+
+# 配置操作期间 Ctrl+C / 异常退出：回滚最新备份并恢复看门狗。
+on_run_exit() {
+  if [[ "${IN_CONFIG_OP}" -eq 1 && -n "${CURRENT_BACKUP}" && -d "${CURRENT_BACKUP}" ]]; then
+    restore_backup_dir "${CURRENT_BACKUP}" || true
+    xcc_log WARN "配置操作异常退出，已从备份恢复"
+  fi
+  if [[ "${WATCHDOG_PAUSED}" -eq 1 ]]; then
+    systemctl start xcc-watchdog >/dev/null 2>&1 || true
+    WATCHDOG_PAUSED=0
+  fi
+}
+
+begin_config_op() {
+  IN_CONFIG_OP=1
+  pause_watchdog
+  CURRENT_BACKUP=$(backup_runtime_configs) || CURRENT_BACKUP=""
+}
+
+end_config_op_ok() {
+  IN_CONFIG_OP=0
+  if [[ -n "${CURRENT_BACKUP}" && -d "${CURRENT_BACKUP}" ]]; then
+    rm -rf "${CURRENT_BACKUP}"
+  fi
+  CURRENT_BACKUP=""
+  resume_watchdog
+}
+
+end_config_op_fail() {
+  if [[ -n "${CURRENT_BACKUP}" && -d "${CURRENT_BACKUP}" ]]; then
+    restore_backup_dir "${CURRENT_BACKUP}" || true
+  fi
+  IN_CONFIG_OP=0
+  CURRENT_BACKUP=""
+  resume_watchdog
+}
+
+end_config_op_cancel() {
+  IN_CONFIG_OP=0
+  if [[ -n "${CURRENT_BACKUP}" && -d "${CURRENT_BACKUP}" ]]; then
+    rm -rf "${CURRENT_BACKUP}"
+  fi
+  CURRENT_BACKUP=""
+  resume_watchdog
+}
+
+backup_runtime_configs() {
+  local stamp dest
+  stamp=$(date '+%Y%m%d-%H%M%S')
+  dest="${XCC_BACKUP_DIR}/${stamp}"
+  mkdir -p "${dest}"
+  cp -a "${XCC_NODES}" "${dest}/nodes.json" 2>/dev/null || true
+  cp -a "${XCC_OUTBOUND}" "${dest}/outbound.conf" 2>/dev/null || true
+  cp -a "${XRAY_CONF}" "${dest}/xray.json" 2>/dev/null || true
+  cp -a "${HYSTERIA_DIR}" "${dest}/hysteria" 2>/dev/null || true
+  cp -a "${SSHD_CONFIG}" "${dest}/sshd_config" 2>/dev/null || true
+  printf '%s' "${dest}"
+}
+
+restore_backup_dir() {
+  local dest="$1"
+  [[ -d "${dest}" ]] || return 1
+  [[ -f "${dest}/nodes.json" ]] && cp -a "${dest}/nodes.json" "${XCC_NODES}"
+  [[ -f "${dest}/outbound.conf" ]] && cp -a "${dest}/outbound.conf" "${XCC_OUTBOUND}"
+  [[ -f "${dest}/xray.json" ]] && cp -a "${dest}/xray.json" "${XRAY_CONF}"
+  [[ -f "${dest}/sshd_config" ]] && cp -a "${dest}/sshd_config" "${SSHD_CONFIG}"
+  if [[ -d "${dest}/hysteria" ]]; then
+    mkdir -p "${HYSTERIA_DIR}"
+    cp -a "${dest}/hysteria/." "${HYSTERIA_DIR}/"
+  fi
+}
+
+#===============================================================================
+# 端口占用检测
+#===============================================================================
+port_busy_ss() {
+  local port="$1"
+  ss -H -tuln 2>/dev/null | awk '{print $5}' | grep -Eq ":${port}$"
+}
+
+port_used_by_nodes() {
+  local port="$1"
+  local skip_tag="${2:-}"
+  jq -r --arg skip "${skip_tag}" --argjson port "${port}" '
+    (.reality[]? | select(.tag != $skip) | .port),
+    (.hysteria[]? | select(.tag != $skip) | .port)
+  ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}"
+}
+
+assert_port_free() {
+  local port="$1"
+  local skip_tag="${2:-}"
+  if ! [[ "${port}" =~ ^[0-9]+$ ]] || [[ "${port}" -lt 1 || "${port}" -gt 65535 ]]; then
+    tui_msg "错误" "端口无效: ${port}"
+    return 1
+  fi
+  if port_used_by_nodes "${port}" "${skip_tag}"; then
+    tui_msg "端口占用" "端口 ${port} 已被 xcc 节点使用，请更换端口。"
+    return 1
+  fi
+  if port_busy_ss "${port}"; then
+    tui_msg "端口占用" "检测到端口 ${port} 已被占用（ss -tuln），请更换端口。"
+    return 1
+  fi
+  return 0
+}
+
+#===============================================================================
+# Xray / Hysteria 安装（必须先依赖，再 curl -f 下载，再执行）
+#===============================================================================
+arch_suffix() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'amd64' ;;
+    aarch64|arm64) printf 'arm64' ;;
+    armv7l) printf 'armv7' ;;
+    *) printf 'amd64' ;;
+  esac
+}
+
+xray_installed_version() {
+  if [[ -x "${XRAY_BIN}" ]]; then
+    "${XRAY_BIN}" version 2>/dev/null | head -n1 | awk '{print $2}'
+  fi
+}
+
+hysteria_installed_version() {
+  if [[ -x "${HYSTERIA_BIN}" ]]; then
+    "${HYSTERIA_BIN}" version 2>/dev/null | head -n1 | awk '{print $NF}' | tr -d ','
+  fi
+}
+
+github_latest_tag() {
+  local api="$1"
+  xcc_curl_quick "${api}" 2>/dev/null | jq -r '.tag_name // empty'
+}
+
+version_newer() {
+  local remote="${1#v}"
+  local localv="${2#v}"
+  [[ -z "${localv}" ]] && return 0
+  [[ "${remote}" == "${localv}" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "${localv}" "${remote}" | sort -V | tail -n1)" == "${remote}" ]]
+}
+
+# 包管理器安装路径可能不是 /usr/local/bin，做兼容链接。
+link_binary() {
+  local dest="$1"
+  local name="$2"
+  if [[ -x "${dest}" ]]; then
+    return 0
+  fi
+  local found
+  found=$(command -v "${name}" 2>/dev/null || true)
+  if [[ -n "${found}" && -x "${found}" && "${found}" != "${dest}" ]]; then
+    ln -sf "${found}" "${dest}" 2>/dev/null || cp -a "${found}" "${dest}" || true
+  fi
+}
+
+# 安装最新 TLS 版本 Xray（官方脚本，失败则降级包管理器）。
+install_xray() {
+  local script latest installed
+  latest=$(github_latest_tag "${XRAY_RELEASE_API}" || true)
+  installed=$(xray_installed_version || true)
+
+  if [[ -x "${XRAY_BIN}" ]]; then
+    info "已安装 Xray ${installed:-unknown}，最新版本 ${latest:-unknown}"
+    if [[ -n "${latest}" ]] && version_newer "${latest}" "${installed}"; then
+      if tui_yesno "Xray 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级到最新 TLS 版本？"; then
+        :
+      else
+        return 0
+      fi
+    else
+      return 0
+    fi
+  fi
+
+  check_legacy_xray_pkg
+  info "正在通过官方脚本安装最新 Xray..."
+  script=$(xcc_mktemp)
+  if ! xcc_curl "${script}" "${XRAY_INSTALL_URL}"; then
+    warn "官方安装脚本下载失败，尝试包管理器（可能不是最新 TLS 版本）。"
+    pkg_install xray || return 1
+    link_binary "${XRAY_BIN}" xray
+    return 0
+  fi
+  chmod 700 "${script}"
+  # 等价于官方推荐: bash -c "$(curl -L .../install-release.sh)" @ install
+  if ! bash "${script}" install; then
+    warn "官方脚本安装失败，尝试包管理器降级安装。"
+    pkg_install xray || {
+      rm -f "${script}"
+      return 1
+    }
+    link_binary "${XRAY_BIN}" xray
+  fi
+  rm -f "${script}"
+  link_binary "${XRAY_BIN}" xray
+  mkdir -p "$(dirname "${XRAY_CONF}")"
+  ensure_xray_inbounds_array
+  systemctl enable xray >/dev/null 2>&1 || true
+  check_apparmor_xray
+  info "Xray 安装完成: $(xray_installed_version || echo unknown)"
+}
+
+install_hysteria() {
+  local latest installed arch url tmp
+  latest=$(github_latest_tag "${HYSTERIA_RELEASE_API}" || true)
+  installed=$(hysteria_installed_version || true)
+  arch=$(arch_suffix)
+
+  if [[ -x "${HYSTERIA_BIN}" ]]; then
+    info "已安装 Hysteria ${installed:-unknown}，最新版本 ${latest:-unknown}"
+    if [[ -n "${latest}" ]] && version_newer "${latest}" "${installed}"; then
+      if ! tui_yesno "Hysteria 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级？"; then
+        return 0
+      fi
+    else
+      return 0
+    fi
+  fi
+
+  info "正在从 GitHub Release 安装 Hysteria..."
+  url="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${arch}"
+  tmp=$(xcc_mktemp)
+  if ! xcc_curl "${tmp}" "${url}"; then
+    warn "GitHub 下载 Hysteria 失败，尝试包管理器。"
+    pkg_install hysteria || return 1
+    link_binary "${HYSTERIA_BIN}" hysteria
+    return 0
+  fi
+  chmod 755 "${tmp}"
+  mv "${tmp}" "${HYSTERIA_BIN}"
+  chmod 755 "${HYSTERIA_BIN}"
+  link_binary "${HYSTERIA_BIN}" hysteria
+  mkdir -p "${HYSTERIA_DIR}"
+  chmod 700 "${HYSTERIA_DIR}"
+  info "Hysteria 安装完成: $(hysteria_installed_version || echo unknown)"
+}
+
+#===============================================================================
+# systemd / logrotate
+#===============================================================================
+install_watchdog_unit() {
+  cat > "${WATCHDOG_UNIT}" <<'EOF'
+[Unit]
+Description=xcc watchdog (Xray 自愈 / 日志自维护)
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xcc watchdog
+Restart=always
+RestartSec=10
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now xcc-watchdog >/dev/null 2>&1 || true
+}
+
+install_hysteria_unit() {
+  cat > "${HYSTERIA_UNIT}" <<'EOF'
+[Unit]
+Description=Hysteria 2 server (%i)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config-%i.json
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+install_logrotate() {
+  cat > "${LOGROTATE_CONF}" <<'EOF'
+/var/log/xcc.log {
+    daily
+    rotate 3
+    compress
+    delaycompress
+    missingok
+    notifempty
+    size 50M
+    copytruncate
+}
+EOF
+}
+
+ensure_environment() {
+  ensure_locale
+  init_tmp
+  detect_os
+  check_os_support
+  ensure_deps
+  tui_init
+  ensure_dirs
+  check_config_format
+  check_ntp
+  check_cloud_init
+  check_network_manager
+  check_unattended_upgrades
+  install_xray
+  install_hysteria || warn "Hysteria 暂未安装，配置 Hysteria 节点时会重试。"
+  install_hysteria_unit
+  install_logrotate
+  install_watchdog_unit
+  : >> "${XCC_LOG}"
+  chmod 640 "${XCC_LOG}" 2>/dev/null || true
+}
+
+#===============================================================================
+# 出站解析与 Xray/Hysteria 配置应用
+#===============================================================================
+outbound_mode() {
+  if [[ ! -f "${XCC_OUTBOUND}" ]]; then
+    printf 'direct'
+    return
+  fi
+  local url
+  url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
+  if [[ -z "${url}" || "${url}" == DIRECT || "${url}" == direct ]]; then
+    printf 'direct'
+  else
+    printf 'proxy'
+  fi
+}
+
+# 解析 SOCKS5://user:pass@ip:port
+parse_socks5() {
+  local url="$1"
+  SOCKS_USER=""
+  SOCKS_PASS=""
+  SOCKS_HOST=""
+  SOCKS_PORT=""
+  url="${url#SOCKS5://}"
+  url="${url#socks5://}"
+  url="${url#SOCKS5H://}"
+  url="${url#socks5h://}"
+  if [[ "${url}" == *"@"* ]]; then
+    local cred rest
+    cred="${url%@*}"
+    rest="${url##*@}"
+    SOCKS_USER="${cred%%:*}"
+    SOCKS_PASS="${cred#*:}"
+    SOCKS_HOST="${rest%%:*}"
+    SOCKS_PORT="${rest##*:}"
+  else
+    SOCKS_HOST="${url%%:*}"
+    SOCKS_PORT="${url##*:}"
+  fi
+}
+
+public_ip() {
+  xcc_curl_stdout "${IPIFY_URL}" -4 --max-time 8 2>/dev/null \
+    || xcc_curl_stdout "https://ifconfig.me" -4 --max-time 8 2>/dev/null \
+    || hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+# Xray 语法检查：优先 run -test，失败则降级 -test。
+xray_test_config() {
+  local cfg="${1:-${XRAY_CONF}}"
+  local out
+  if "${XRAY_BIN}" run -test -config "${cfg}" >/dev/null 2>&1; then
+    return 0
+  fi
+  if "${XRAY_BIN}" -test -config "${cfg}" >/dev/null 2>&1; then
+    return 0
+  fi
+  out=$("${XRAY_BIN}" run -test -config "${cfg}" 2>&1 | tail -n 20 || true)
+  err "${out}"
+  return 1
+}
+
+xray_reload_or_restart() {
+  if systemctl reload xray >/dev/null 2>&1; then
+    return 0
+  fi
+  systemctl restart xray
+}
+
+# Hysteria 语法检查：优先 check；不支持 check 时校验 JSON，避免试启动占用端口。
+hysteria_test_config() {
+  local cfg="$1"
+  if [[ -x "${HYSTERIA_BIN}" ]]; then
+    if "${HYSTERIA_BIN}" check -config "${cfg}" >/dev/null 2>&1 \
+      || "${HYSTERIA_BIN}" check -c "${cfg}" >/dev/null 2>&1; then
+      return 0
+    fi
+  fi
+  jq empty "${cfg}" >/dev/null 2>&1
+}
+
+# 根据 nodes.json + outbound.conf 重建 Xray 配置。
+# 路由顺序：Hysteria 入站（若有对应 tag）→ Reality 入站 → 默认出站。
+apply_xray_config() {
+  local tmp dns_json mode proxy_json node_json
+  ensure_xray_inbounds_array
+  dns_json=$(dns_servers_json)
+  mode=$(outbound_mode)
+
+  if [[ "${mode}" == "proxy" ]]; then
+    local url
+    url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
+    parse_socks5 "${url}"
+    if [[ -z "${SOCKS_HOST}" || ! "${SOCKS_PORT}" =~ ^[0-9]+$ ]]; then
+      err "outbound.conf 格式无效，应为 SOCKS5://user:pass@ip:port"
+      return 1
+    fi
+    if [[ -n "${SOCKS_USER}" ]]; then
+      proxy_json=$(jq -n \
+        --arg host "${SOCKS_HOST}" \
+        --argjson port "${SOCKS_PORT}" \
+        --arg user "${SOCKS_USER}" \
+        --arg pass "${SOCKS_PASS}" \
+        '{tag:"proxy",protocol:"socks",settings:{servers:[{address:$host,port:$port,users:[{user:$user,pass:$pass}]}]}}')
+    else
+      proxy_json=$(jq -n \
+        --arg host "${SOCKS_HOST}" \
+        --argjson port "${SOCKS_PORT}" \
+        '{tag:"proxy",protocol:"socks",settings:{servers:[{address:$host,port:$port}]}}')
+    fi
+  else
+    proxy_json='{"tag":"proxy","protocol":"freedom","settings":{}}'
+  fi
+
+  node_json=$(cat "${XCC_NODES}")
+  tmp=$(xcc_mktemp)
+
+  jq -n \
+    --argjson dns "${dns_json}" \
+    --argjson nodes "${node_json}" \
+    --argjson proxy "${proxy_json}" \
+    --arg default_tag "$( [[ "${mode}" == "proxy" ]] && echo proxy || echo direct )" \
+    '
+    def reality_inbound:
+      {
+        tag: .tag,
+        listen: "0.0.0.0",
+        port: .port,
+        protocol: "vless",
+        settings: {
+          clients: [{id: .uuid, flow: (.flow // "xtls-rprx-vision"), email: "xcc"}],
+          decryption: "none"
+        },
+        streamSettings: {
+          network: "tcp",
+          security: "reality",
+          tls: "1.3",
+          realitySettings: {
+            show: false,
+            dest: .dest,
+            xver: 0,
+            serverNames: [.sni],
+            privateKey: .private_key,
+            shortIds: [(.short_id // "")]
+          }
+        },
+        sniffing: {enabled: true, destOverride: ["http","tls","quic"]}
+      };
+
+    {
+      log: {loglevel: "warning"},
+      dns: {servers: $dns},
+      inbounds: [ $nodes.reality[]? | select(.enabled == true) | reality_inbound ],
+      outbounds: [
+        (if $default_tag == "proxy" then $proxy else {tag:"direct", protocol:"freedom", settings:{}} end),
+        (if $default_tag == "proxy" then {tag:"direct", protocol:"freedom", settings:{}} else $proxy end),
+        {tag:"block", protocol:"blackhole", settings:{}}
+      ],
+      routing: {
+        domainStrategy: "AsIs",
+        rules:
+          ([ $nodes.hysteria[]? | select(.enabled == true) | {type:"field", inboundTag:[.tag], outboundTag:(.outbound // $default_tag)} ])
+          +
+          ([ $nodes.reality[]? | select(.enabled == true) | {type:"field", inboundTag:[.tag], outboundTag:(.outbound // $default_tag)} ])
+      }
+    }
+    ' > "${tmp}"
+
+  if ! xray_test_config "${tmp}"; then
+    err "Xray 配置语法检查失败，已拒绝写入。"
+    rm -f "${tmp}"
+    return 1
+  fi
+  mv "${tmp}" "${XRAY_CONF}"
+  chmod 600 "${XRAY_CONF}"
+  xray_reload_or_restart
+}
+
+hysteria_outbound_json() {
+  local node_ob="$1"
+  local mode
+  mode=$(outbound_mode)
+  if [[ "${node_ob}" == "direct" || "${mode}" != "proxy" ]]; then
+    printf '%s' '[]'
+    return
+  fi
+  local url
+  url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
+  parse_socks5 "${url}"
+  jq -n \
+    --arg addr "${SOCKS_HOST}:${SOCKS_PORT}" \
+    --arg user "${SOCKS_USER}" \
+    --arg pass "${SOCKS_PASS}" \
+    '[{name:"proxy", type:"socks5", socks5:(
+        {addr:$addr} + (if $user == "" then {} else {username:$user, password:$pass} end)
+      )}]'
+}
+
+write_hysteria_node_config() {
+  local tag="$1"
+  local tmp cfg ob json
+  json=$(jq -c --arg tag "${tag}" '.hysteria[] | select(.tag==$tag)' "${XCC_NODES}")
+  [[ -n "${json}" ]] || return 1
+  local port password obfs acme domain email sni outbound
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  password=$(printf '%s' "${json}" | jq -r '.password')
+  obfs=$(printf '%s' "${json}" | jq -r '.obfs // empty')
+  acme=$(printf '%s' "${json}" | jq -r '.acme')
+  domain=$(printf '%s' "${json}" | jq -r '.domain // empty')
+  email=$(printf '%s' "${json}" | jq -r '.email // "admin@localhost"')
+  sni=$(printf '%s' "${json}" | jq -r '.sni // .domain // "localhost"')
+  outbound=$(printf '%s' "${json}" | jq -r '.outbound // "proxy"')
+  cfg="${HYSTERIA_DIR}/config-${port}.json"
+  tmp=$(xcc_mktemp)
+  ob=$(hysteria_outbound_json "${outbound}")
+
+  if [[ "${acme}" == "true" ]]; then
+    jq -n \
+      --argjson port "${port}" \
+      --arg password "${password}" \
+      --arg obfs "${obfs}" \
+      --arg domain "${domain}" \
+      --arg email "${email}" \
+      --argjson outbounds "${ob}" \
+      --arg masq "https://www.microsoft.com" \
+      '
+      {
+        listen: (":" + ($port|tostring)),
+        auth: {type:"password", password:$password},
+        tls: {acme:{domains:[$domain], email:$email}},
+        masquerade: {type:"proxy", proxy:{url:$masq, rewriteHost:true}}
+      }
+      + (if $obfs == "" then {} else {obfs:{type:"salamander", salamander:{password:$obfs}}} end)
+      + (if ($outbounds|length) == 0 then {} else {outbounds:$outbounds} end)
+      ' > "${tmp}"
+  else
+    local cert="${HYSTERIA_DIR}/server-${port}.crt"
+    local key="${HYSTERIA_DIR}/server-${port}.key"
+    if [[ ! -f "${cert}" || ! -f "${key}" ]]; then
+      openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+        -keyout "${key}" -out "${cert}" -subj "/CN=${sni}" >/dev/null 2>&1
+      chmod 600 "${key}"
+    fi
+    jq -n \
+      --argjson port "${port}" \
+      --arg password "${password}" \
+      --arg obfs "${obfs}" \
+      --arg cert "${cert}" \
+      --arg key "${key}" \
+      --argjson outbounds "${ob}" \
+      --arg masq "https://www.microsoft.com" \
+      '
+      {
+        listen: (":" + ($port|tostring)),
+        auth: {type:"password", password:$password},
+        tls: {cert:$cert, key:$key},
+        masquerade: {type:"proxy", proxy:{url:$masq, rewriteHost:true}}
+      }
+      + (if $obfs == "" then {} else {obfs:{type:"salamander", salamander:{password:$obfs}}} end)
+      + (if ($outbounds|length) == 0 then {} else {outbounds:$outbounds} end)
+      ' > "${tmp}"
+  fi
+
+  if ! hysteria_test_config "${tmp}"; then
+    err "Hysteria 配置语法检查失败: ${cfg}"
+    rm -f "${tmp}"
+    return 1
+  fi
+  mv "${tmp}" "${cfg}"
+  chmod 600 "${cfg}"
+  # 兼容用户指定的默认路径
+  cp -a "${cfg}" "${HYSTERIA_CONF}"
+  chmod 600 "${HYSTERIA_CONF}"
+}
+
+apply_hysteria_config() {
+  local p enabled tag
+  install_hysteria_unit
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] || continue
+    enabled=$(jq -r --argjson port "${p}" '.hysteria[] | select(.port==$port) | .enabled' "${XCC_NODES}")
+    if [[ "${enabled}" == "true" ]]; then
+      tag=$(jq -r --argjson port "${p}" '.hysteria[] | select(.port==$port) | .tag' "${XCC_NODES}")
+      write_hysteria_node_config "${tag}" || return 1
+      systemctl enable --now "hysteria@${p}" >/dev/null 2>&1 || systemctl restart "hysteria@${p}"
+    else
+      systemctl stop "hysteria@${p}" >/dev/null 2>&1 || true
+      systemctl disable "hysteria@${p}" >/dev/null 2>&1 || true
+    fi
+  done < <(jq -r '.hysteria[]?.port' "${XCC_NODES}" 2>/dev/null)
+}
+
+apply_all_configs() {
+  apply_xray_config || return 1
+  apply_hysteria_config || return 1
+  return 0
+}
+
+#===============================================================================
+# Reality / Hysteria 密钥与分享链接
+#===============================================================================
+rand_hex() {
+  openssl rand -hex "${1:-4}"
+}
+
+rand_alnum() {
+  local n="${1:-16}"
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c "${n}"
+}
+
+# 调用 xray x25519，按规范提取 PrivateKey / PublicKey（忽略空行）。
+xray_x25519() {
+  local out priv pub
+  out=$("${XRAY_BIN}" x25519 2>/dev/null)
+  priv=$(printf '%s\n' "${out}" | sed -n 's/^PrivateKey: //p' | sed '/^$/d' | head -n1)
+  pub=$(printf '%s\n' "${out}" | sed -n 's/^PublicKey: //p' | sed '/^$/d' | head -n1)
+  if [[ -z "${pub}" ]]; then
+    pub=$(printf '%s\n' "${out}" | sed -n 's/^Password (PublicKey): //p' | sed '/^$/d' | head -n1)
+  fi
+  if [[ -z "${pub}" ]]; then
+    pub=$(printf '%s\n' "${out}" | sed -n 's/^Password: //p' | sed '/^$/d' | head -n1)
+  fi
+  if [[ -z "${priv}" || -z "${pub}" ]]; then
+    return 1
+  fi
+  REALITY_PRIV="${priv}"
+  REALITY_PUB="${pub}"
+}
+
+xray_uuid() {
+  "${XRAY_BIN}" uuid
+}
+
+reality_share_link() {
+  local json="$1"
+  local ip uuid port sni pbk sid flow fp remark
+  ip=$(public_ip)
+  uuid=$(printf '%s' "${json}" | jq -r '.uuid')
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  sni=$(printf '%s' "${json}" | jq -r '.sni')
+  pbk=$(printf '%s' "${json}" | jq -r '.public_key')
+  sid=$(printf '%s' "${json}" | jq -r '.short_id')
+  flow=$(printf '%s' "${json}" | jq -r '.flow // "xtls-rprx-vision"')
+  fp=$(printf '%s' "${json}" | jq -r '.fingerprint // "chrome"')
+  remark="xcc-reality-${port}"
+  printf 'vless://%s@%s:%s?encryption=none&flow=%s&security=reality&sni=%s&fp=%s&pbk=%s&sid=%s#%s\n' \
+    "${uuid}" "${ip}" "${port}" "${flow}" "${sni}" "${fp}" "${pbk}" "${sid}" "${remark}"
+}
+
+hysteria_share_link() {
+  local json="$1"
+  local ip port password obfs insecure sni remark url
+  ip=$(public_ip)
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  password=$(printf '%s' "${json}" | jq -r '.password')
+  obfs=$(printf '%s' "${json}" | jq -r '.obfs // empty')
+  insecure=$(printf '%s' "${json}" | jq -r '.insecure // true')
+  sni=$(printf '%s' "${json}" | jq -r '.sni // .domain // empty')
+  remark="xcc-hysteria-${port}"
+  url="hy2://${password}@${ip}:${port}?"
+  if [[ "${insecure}" == "true" ]]; then
+    url+="insecure=1"
+  else
+    url+="insecure=0"
+  fi
+  [[ -n "${sni}" ]] && url+="&sni=${sni}"
+  if [[ -n "${obfs}" ]]; then
+    url+="&obfs=salamander&obfs-password=${obfs}"
+  fi
+  url+="#${remark}"
+  printf '%s\n' "${url}"
+}
+
+show_share_and_qr() {
+  local title="$1"
+  local link="$2"
+  local tmp
+  tmp=$(xcc_mktemp)
+  {
+    echo "${title}"
+    echo
+    echo "${link}"
+    echo
+    if command -v qrencode >/dev/null 2>&1; then
+      qrencode -t ansiutf8 "${link}" 2>/dev/null || echo "(二维码生成失败)"
+    else
+      echo "未安装 qrencode，无法显示二维码。"
+    fi
+  } > "${tmp}"
+  if [[ "${TUI_BACKEND}" == "cli" || "${TUI_BACKEND}" == "whiptail" || "${TUI_BACKEND}" == "dialog" ]]; then
+    clear
+    cat "${tmp}"
+    echo
+    read -r -p "按回车返回菜单..." _ || true
+  fi
+  rm -f "${tmp}"
+}
+
+#===============================================================================
+# 菜单：配置 Reality
+#===============================================================================
+menu_config_reality() {
+  local port sni dest domain uuid tag
+  begin_config_op
+  port=$(tui_input "配置 Reality 节点" "请输入端口" "443") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  domain=$(tui_input "配置 Reality 节点" "请输入伪装域名" "www.microsoft.com") || { end_config_op_cancel; return 1; }
+  sni=$(tui_input "配置 Reality 节点" "请输入 SNI（客户端 TLS 握手域名）" "${domain}") || { end_config_op_cancel; return 1; }
+  dest=$(tui_input "配置 Reality 节点" "请输入 dest（Reality 伪装目标地址）" "${domain}:443") || { end_config_op_cancel; return 1; }
+  if [[ "${dest}" != *:* ]]; then
+    dest="${dest}:443"
+  fi
+  tag="reality-${port}"
+  if jq -e --arg tag "${tag}" '.reality[] | select(.tag==$tag)' "${XCC_NODES}" >/dev/null 2>&1; then
+    if ! tui_yesno "节点已存在" "标签 ${tag} 已存在，是否覆盖？"; then
+      end_config_op_cancel
+      return 1
+    fi
+  fi
+
+  if ! xray_x25519; then
+    tui_msg "错误" "xray x25519 生成密钥失败，请确认已安装最新 TLS 版本 Xray。"
+    end_config_op_fail
+    return 1
+  fi
+  uuid=$(xray_uuid)
+  local short_id node tmp
+  short_id=$(rand_hex 4)
+  node=$(jq -n \
+    --arg tag "${tag}" \
+    --argjson port "${port}" \
+    --arg uuid "${uuid}" \
+    --arg private_key "${REALITY_PRIV}" \
+    --arg public_key "${REALITY_PUB}" \
+    --arg sni "${sni}" \
+    --arg dest "${dest}" \
+    --arg short_id "${short_id}" \
+    --arg domain "${domain}" \
+    '{
+      tag:$tag, enabled:true, port:$port, uuid:$uuid,
+      private_key:$private_key, public_key:$public_key,
+      sni:$sni, dest:$dest, domain:$domain,
+      flow:"xtls-rprx-vision", fingerprint:"chrome",
+      tls:"1.3", short_id:$short_id, outbound:"proxy"
+    }')
+  tmp=$(xcc_mktemp)
+  jq --arg tag "${tag}" --argjson node "${node}" \
+    '(.reality) |= (map(select(.tag != $tag)) + [$node])' \
+    "${XCC_NODES}" > "${tmp}"
+  mv "${tmp}" "${XCC_NODES}"
+  chmod 600 "${XCC_NODES}"
+
+  fw_allow_tcp "${port}"
+  if apply_xray_config; then
+    end_config_op_ok
+    show_share_and_qr "Reality 节点已创建（TLS 1.3 / fp=chrome / flow=xtls-rprx-vision）" \
+      "$(reality_share_link "${node}")"
+  else
+    tui_msg "错误" "写入 Xray 配置失败，已回滚。"
+    end_config_op_fail
+    return 1
+  fi
+}
+
+#===============================================================================
+# 菜单：配置 Hysteria
+#===============================================================================
+menu_config_hysteria() {
+  local port password obfs domain email sni tag use_acme
+  begin_config_op
+  install_hysteria || { tui_msg "错误" "Hysteria 安装失败"; end_config_op_fail; return 1; }
+  port=$(tui_input "配置 Hysteria 节点" "请输入端口" "8443") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  password=$(tui_input "配置 Hysteria 节点" "请输入密码（回车则随机生成）" "$(rand_alnum 16)") || { end_config_op_cancel; return 1; }
+  if tui_yesno "salamander 混淆" "是否启用 salamander 混淆？（推荐启用）"; then
+    obfs=$(tui_input "混淆参数" "salamander 密码（回车随机）" "$(rand_alnum 16)") || { end_config_op_cancel; return 1; }
+  else
+    obfs=""
+  fi
+  domain=""
+  email="admin@localhost"
+  sni="localhost"
+  if tui_yesno "ACME 证书" "是否启用 ACME（需要已解析到本机的域名）？"; then
+    use_acme="true"
+    domain=$(tui_input "ACME 域名" "请输入域名" "") || { end_config_op_cancel; return 1; }
+    email=$(tui_input "ACME 邮箱" "请输入邮箱" "admin@${domain}") || { end_config_op_cancel; return 1; }
+    sni="${domain}"
+  else
+    use_acme="false"
+    tui_msg "自签名证书" "未启用 ACME，将生成自签名证书（客户端需 insecure，仅限测试）。"
+  fi
+  tag="hysteria-${port}"
+  local node tmp insecure
+  insecure="true"
+  [[ "${use_acme}" == "true" ]] && insecure="false"
+  node=$(jq -n \
+    --arg tag "${tag}" \
+    --argjson port "${port}" \
+    --arg password "${password}" \
+    --arg obfs "${obfs}" \
+    --arg acme "${use_acme}" \
+    --arg domain "${domain}" \
+    --arg email "${email}" \
+    --arg sni "${sni}" \
+    --arg insecure "${insecure}" \
+    '{
+      tag:$tag, enabled:true, port:$port, password:$password, obfs:$obfs,
+      acme:($acme=="true"), domain:$domain, email:$email, sni:$sni,
+      insecure:($insecure=="true"), outbound:"proxy"
+    }')
+  tmp=$(xcc_mktemp)
+  jq --arg tag "${tag}" --argjson node "${node}" \
+    '(.hysteria) |= (map(select(.tag != $tag)) + [$node])' \
+    "${XCC_NODES}" > "${tmp}"
+  mv "${tmp}" "${XCC_NODES}"
+  chmod 600 "${XCC_NODES}"
+  fw_allow_udp "${port}"
+  fw_allow_tcp "${port}"
+  if apply_hysteria_config && apply_xray_config; then
+    end_config_op_ok
+    show_share_and_qr "Hysteria 节点已创建" "$(hysteria_share_link "${node}")"
+  else
+    tui_msg "错误" "写入 Hysteria 配置失败，已回滚。"
+    end_config_op_fail
+    return 1
+  fi
+}
+
+#===============================================================================
+# 节点选择
+#===============================================================================
+select_node_tag() {
+  local kind="$1"
+  local title="$2"
+  local count items=() tag desc
+  count=$(jq -r --arg k "${kind}" '.[$k] | length' "${XCC_NODES}")
+  if [[ "${count}" -eq 0 ]]; then
+    tui_msg "提示" "尚未配置 ${kind} 节点。"
+    return 1
+  fi
+  while IFS=$'\t' read -r tag desc; do
+    items+=("${tag}" "${desc}")
+  done < <(jq -r --arg k "${kind}" '
+    .[$k][] | [.tag, ((if .enabled then "启用" else "禁用" end) + " port=" + (.port|tostring) + " outbound=" + (.outbound // "proxy"))] | @tsv
+  ' "${XCC_NODES}")
+  tui_menu "${title}" "请选择节点" "${items[@]}"
+}
+
+node_json_by_tag() {
+  local kind="$1"
+  local tag="$2"
+  jq -c --arg k "${kind}" --arg tag "${tag}" '.[$k][] | select(.tag==$tag)' "${XCC_NODES}"
+}
+
+upsert_node() {
+  local kind="$1"
+  local node="$2"
+  local tag tmp
+  tag=$(printf '%s' "${node}" | jq -r '.tag')
+  tmp=$(xcc_mktemp)
+  jq --arg k "${kind}" --arg tag "${tag}" --argjson node "${node}" \
+    '.[$k] = (.[$k] | map(select(.tag != $tag)) + [$node])' \
+    "${XCC_NODES}" > "${tmp}"
+  mv "${tmp}" "${XCC_NODES}"
+  chmod 600 "${XCC_NODES}"
+}
+
+delete_node() {
+  local kind="$1"
+  local tag="$2"
+  local tmp
+  tmp=$(xcc_mktemp)
+  jq --arg k "${kind}" --arg tag "${tag}" '.[$k] |= map(select(.tag != $tag))' \
+    "${XCC_NODES}" > "${tmp}"
+  mv "${tmp}" "${XCC_NODES}"
+  chmod 600 "${XCC_NODES}"
+}
+
+set_node_field() {
+  local kind="$1" tag="$2" key="$3" value="$4" is_json="${5:-0}"
+  local tmp
+  tmp=$(xcc_mktemp)
+  if [[ "${is_json}" -eq 1 ]]; then
+    jq --arg k "${kind}" --arg tag "${tag}" --arg key "${key}" --argjson val "${value}" \
+      '(.[$k][] | select(.tag==$tag) | .[$key]) = $val' "${XCC_NODES}" > "${tmp}"
+  else
+    jq --arg k "${kind}" --arg tag "${tag}" --arg key "${key}" --arg val "${value}" \
+      '(.[$k][] | select(.tag==$tag) | .[$key]) = $val' "${XCC_NODES}" > "${tmp}"
+  fi
+  mv "${tmp}" "${XCC_NODES}"
+  chmod 600 "${XCC_NODES}"
+}
+
+#===============================================================================
+# 菜单：管理 Reality
+#===============================================================================
+menu_manage_reality() {
+  local tag json choice port
+  tag=$(select_node_tag reality "管理 Reality 节点") || return 1
+  json=$(node_json_by_tag reality "${tag}")
+  while true; do
+    json=$(node_json_by_tag reality "${tag}")
+    [[ -n "${json}" ]] || return 0
+    local status
+    status=$(printf '%s' "${json}" | jq -r '"\(.tag)  端口:\(.port)  状态:\(if .enabled then "启用" else "禁用" end)  SNI:\(.sni)  dest:\(.dest)  TLS:\(.tls // "1.3")  出站:\(.outbound // "proxy")"')
+    choice=$(tui_menu "管理 Reality" "${status}" \
+      "toggle" "启用 / 禁用" \
+      "port"   "修改端口" \
+      "sni"    "更新伪装域名 / SNI / dest" \
+      "tls"    "更新 TLS 版本（强制 1.3）" \
+      "out"    "设置该节点出站方式（Shifter 或直连）" \
+      "share"  "显示分享链接与二维码" \
+      "del"    "删除节点" \
+      "back"   "返回主菜单") || return 0
+    case "${choice}" in
+      toggle)
+        begin_config_op
+        if [[ "$(printf '%s' "${json}" | jq -r '.enabled')" == "true" ]]; then
+          set_node_field reality "${tag}" enabled false 1
+        else
+          set_node_field reality "${tag}" enabled true 1
+        fi
+        if apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      port)
+        begin_config_op
+        port=$(tui_input "修改端口" "新端口" "$(printf '%s' "${json}" | jq -r '.port')") || { end_config_op_cancel; continue; }
+        assert_port_free "${port}" "${tag}" || { end_config_op_cancel; continue; }
+        set_node_field reality "${tag}" port "${port}" 1
+        local newtag="reality-${port}"
+        set_node_field reality "${tag}" tag "${newtag}"
+        fw_allow_tcp "${port}"
+        tag="${newtag}"
+        if apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      sni)
+        begin_config_op
+        local domain sni dest
+        domain=$(tui_input "伪装域名" "伪装域名" "$(printf '%s' "${json}" | jq -r '.domain // .sni')") || { end_config_op_cancel; continue; }
+        sni=$(tui_input "SNI" "SNI" "${domain}") || { end_config_op_cancel; continue; }
+        dest=$(tui_input "dest" "dest" "${domain}:443") || { end_config_op_cancel; continue; }
+        [[ "${dest}" == *:* ]] || dest="${dest}:443"
+        set_node_field reality "${tag}" domain "${domain}"
+        set_node_field reality "${tag}" sni "${sni}"
+        set_node_field reality "${tag}" dest "${dest}"
+        if apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      tls)
+        begin_config_op
+        local tlsv
+        tlsv=$(tui_input "TLS 版本" "当前强制使用 TLS 1.3" "1.3") || { end_config_op_cancel; continue; }
+        if [[ "${tlsv}" != "1.3" ]]; then
+          tui_msg "提示" "xcc 强制使用 TLS 1.3，已忽略其他输入。"
+        fi
+        set_node_field reality "${tag}" tls "1.3"
+        if apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      out)
+        begin_config_op
+        local ob
+        ob=$(tui_menu "出站方式" "为 ${tag} 选择出站" \
+          "proxy" "Shifter / SOCKS5 默认出站" \
+          "direct" "直连") || { end_config_op_cancel; continue; }
+        set_node_field reality "${tag}" outbound "${ob}"
+        if apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      share)
+        show_share_and_qr "Reality 分享链接" "$(reality_share_link "${json}")"
+        ;;
+      del)
+        begin_config_op
+        if tui_yesno "删除节点" "确认删除 ${tag}？"; then
+          delete_node reality "${tag}"
+          if apply_xray_config; then end_config_op_ok; tui_msg "完成" "节点已删除"; return 0
+          else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        else
+          end_config_op_cancel
+        fi
+        ;;
+      back|*) return 0 ;;
+    esac
+  done
+}
+
+#===============================================================================
+# 菜单：管理 Hysteria
+#===============================================================================
+menu_manage_hysteria() {
+  local tag json choice port
+  tag=$(select_node_tag hysteria "管理 Hysteria 节点") || return 1
+  json=$(node_json_by_tag hysteria "${tag}")
+  while true; do
+    json=$(node_json_by_tag hysteria "${tag}")
+    [[ -n "${json}" ]] || return 0
+    local status
+    status=$(printf '%s' "${json}" | jq -r '"\(.tag)  端口:\(.port)  状态:\(if .enabled then "启用" else "禁用" end)  出站:\(.outbound // "proxy")"')
+    choice=$(tui_menu "管理 Hysteria" "${status}" \
+      "toggle" "启用 / 禁用" \
+      "port"   "修改端口" \
+      "pass"   "更新密码" \
+      "out"    "设置该节点出站方式（Shifter 或直连）" \
+      "share"  "显示分享链接与二维码" \
+      "del"    "删除节点" \
+      "back"   "返回主菜单") || return 0
+    case "${choice}" in
+      toggle)
+        begin_config_op
+        if [[ "$(printf '%s' "${json}" | jq -r '.enabled')" == "true" ]]; then
+          set_node_field hysteria "${tag}" enabled false 1
+        else
+          set_node_field hysteria "${tag}" enabled true 1
+        fi
+        if apply_hysteria_config && apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      port)
+        begin_config_op
+        local oldport
+        oldport=$(printf '%s' "${json}" | jq -r '.port')
+        port=$(tui_input "修改端口" "新端口" "${oldport}") || { end_config_op_cancel; continue; }
+        assert_port_free "${port}" "${tag}" || { end_config_op_cancel; continue; }
+        set_node_field hysteria "${tag}" port "${port}" 1
+        set_node_field hysteria "${tag}" tag "hysteria-${port}"
+        systemctl stop "hysteria@${oldport}" >/dev/null 2>&1 || true
+        systemctl disable "hysteria@${oldport}" >/dev/null 2>&1 || true
+        fw_allow_udp "${port}"
+        fw_allow_tcp "${port}"
+        tag="hysteria-${port}"
+        if apply_hysteria_config && apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      pass)
+        begin_config_op
+        local pw
+        pw=$(tui_input "更新密码" "新密码" "$(printf '%s' "${json}" | jq -r '.password')") || { end_config_op_cancel; continue; }
+        set_node_field hysteria "${tag}" password "${pw}"
+        if apply_hysteria_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      out)
+        begin_config_op
+        local ob
+        ob=$(tui_menu "出站方式" "为 ${tag} 选择出站" \
+          "proxy" "Shifter / SOCKS5 默认出站" \
+          "direct" "直连") || { end_config_op_cancel; continue; }
+        set_node_field hysteria "${tag}" outbound "${ob}"
+        if apply_hysteria_config && apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        ;;
+      share)
+        show_share_and_qr "Hysteria 分享链接" "$(hysteria_share_link "${json}")"
+        ;;
+      del)
+        begin_config_op
+        if tui_yesno "删除节点" "确认删除 ${tag}？"; then
+          port=$(printf '%s' "${json}" | jq -r '.port')
+          delete_node hysteria "${tag}"
+          systemctl stop "hysteria@${port}" >/dev/null 2>&1 || true
+          systemctl disable "hysteria@${port}" >/dev/null 2>&1 || true
+          if apply_hysteria_config && apply_xray_config; then end_config_op_ok; tui_msg "完成" "节点已删除"; return 0
+          else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        else
+          end_config_op_cancel
+        fi
+        ;;
+      back|*) return 0 ;;
+    esac
+  done
+}
+
+#===============================================================================
+# 菜单：出站代理
+#===============================================================================
+menu_outbound() {
+  local cur choice ip port user pass
+  cur="直连"
+  if [[ -f "${XCC_OUTBOUND}" ]]; then
+    cur=$(head -n1 "${XCC_OUTBOUND}")
+  fi
+  choice=$(tui_menu "设置出站代理" "当前: ${cur}" \
+    "set" "设置 SOCKS5（Shifter）" \
+    "direct" "切换回直连") || return 1
+  begin_config_op
+  case "${choice}" in
+    set)
+      ip=$(tui_input "SOCKS5" "代理 IP" "") || { end_config_op_cancel; return 1; }
+      port=$(tui_input "SOCKS5" "代理端口" "1080") || { end_config_op_cancel; return 1; }
+      if [[ -z "${ip}" || ! "${port}" =~ ^[0-9]+$ ]]; then
+        tui_msg "错误" "IP 或端口无效。"
+        end_config_op_cancel
+        return 1
+      fi
+      user=$(tui_input "SOCKS5" "用户名（可空）" "") || { end_config_op_cancel; return 1; }
+      pass=$(tui_password "SOCKS5" "密码（可空）" "") || { end_config_op_cancel; return 1; }
+      if [[ -n "${user}" ]]; then
+        printf 'SOCKS5://%s:%s@%s:%s\n' "${user}" "${pass}" "${ip}" "${port}" > "${XCC_OUTBOUND}"
+      else
+        printf 'SOCKS5://%s:%s\n' "${ip}" "${port}" > "${XCC_OUTBOUND}"
+      fi
+      chmod 600 "${XCC_OUTBOUND}"
+      ;;
+    direct)
+      printf 'DIRECT\n' > "${XCC_OUTBOUND}"
+      chmod 600 "${XCC_OUTBOUND}"
+      ;;
+  esac
+  if apply_all_configs; then
+    end_config_op_ok
+    tui_msg "完成" "出站已更新，已尝试 systemctl reload xray。"
+  else
+    tui_msg "错误" "应用出站配置失败，已回滚。"
+    end_config_op_fail
+  fi
+}
+
+#===============================================================================
+# 菜单：SSH 端口
+# 先放行新端口，再改配置；sshd -t 失败则回滚。
+#===============================================================================
+current_ssh_port() {
+  awk '/^[Pp]ort[[:space:]]+/ {p=$2} END{if(p) print p; else print 22}' "${SSHD_CONFIG}" 2>/dev/null
+}
+
+menu_ssh_port() {
+  local old new
+  old=$(current_ssh_port)
+  new=$(tui_input "设置 SSH 端口" "当前端口 ${old}，请输入新端口" "${old}") || return 1
+  [[ "${new}" == "${old}" ]] && { tui_msg "提示" "端口未变化。"; return 0; }
+  if ! [[ "${new}" =~ ^[0-9]+$ ]] || [[ "${new}" -lt 1 || "${new}" -gt 65535 ]]; then
+    tui_msg "错误" "无效端口"
+    return 1
+  fi
+  begin_config_op
+  fw_allow_tcp "${new}"
+  # Ubuntu 24.04：若 ufw 为 active，先放行新端口，修改后再 reload；inactive 则跳过。
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n1 | grep -qi 'active'; then
+    ufw allow "${new}/tcp" >/dev/null || true
+  fi
+  cp -a "${SSHD_CONFIG}" "${SSHD_CONFIG}.xccbak"
+  if grep -Eq '^[Pp]ort[[:space:]]+' "${SSHD_CONFIG}"; then
+    sed -i "s/^[Pp]ort[[:space:]].*/Port ${new}/" "${SSHD_CONFIG}"
+  else
+    printf '\nPort %s\n' "${new}" >> "${SSHD_CONFIG}"
+  fi
+  local sshd_err
+  sshd_err=$(xcc_mktemp)
+  if ! sshd -t >"${sshd_err}" 2>&1; then
+    mv "${SSHD_CONFIG}.xccbak" "${SSHD_CONFIG}"
+    tui_msg "错误" "sshd -t 检查失败，已回滚。$(cat "${sshd_err}" 2>/dev/null)"
+    rm -f "${sshd_err}"
+    end_config_op_fail
+    return 1
+  fi
+  rm -f "${sshd_err}"
+  if systemctl restart sshd 2>/dev/null || systemctl restart ssh 2>/dev/null; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | head -n1 | grep -qi 'active'; then
+      ufw reload >/dev/null || true
+    fi
+    end_config_op_ok
+    tui_msg "SSH 端口已修改" "新端口 ${new}。请另开 SSH 窗口测试新端口，确认成功后再清理旧端口规则。"
+    if tui_yesno "清理旧规则" "新端口 ${new} 是否已测试成功？确认后将清理旧端口 ${old} 的防火墙规则。"; then
+      fw_delete_tcp "${old}"
+    fi
+  else
+    mv "${SSHD_CONFIG}.xccbak" "${SSHD_CONFIG}"
+    tui_msg "错误" "重启 SSH 服务失败，已回滚配置。"
+    end_config_op_fail
+    return 1
+  fi
+}
+
+#===============================================================================
+# 备份 / 恢复（备份为只读，不停止看门狗）
+#===============================================================================
+menu_backup() {
+  local dest stamp
+  stamp=$(date '+%Y%m%d-%H%M%S')
+  dest="/root/xcc-backup-${stamp}.tar.gz"
+  mkdir -p "${XCC_DIR}/export"
+  cp -a "${XRAY_CONF}" "${XCC_DIR}/export/xray-config.json" 2>/dev/null || true
+  if [[ -d "${HYSTERIA_DIR}" ]]; then
+    rm -rf "${XCC_DIR}/export/hysteria"
+    cp -a "${HYSTERIA_DIR}" "${XCC_DIR}/export/hysteria" 2>/dev/null || true
+  fi
+  if tar -czf "${dest}" -C /etc xcc; then
+    chmod 600 "${dest}"
+    tui_msg "备份完成" "已保存到 ${dest}"
+  else
+    tui_msg "错误" "备份失败"
+  fi
+}
+
+menu_restore() {
+  local files=() f choice
+  shopt -s nullglob
+  files=(/root/xcc-backup-*.tar.gz)
+  shopt -u nullglob
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    f=$(tui_input "恢复配置" "未在 /root 发现备份，请输入备份文件完整路径" "") || return 1
+  else
+    local items=()
+    for f in "${files[@]}"; do
+      items+=("${f}" "$(basename "${f}")")
+    done
+    items+=("custom" "输入自定义路径")
+    choice=$(tui_menu "恢复配置" "选择备份文件" "${items[@]}") || return 1
+    if [[ "${choice}" == "custom" ]]; then
+      f=$(tui_input "恢复配置" "备份文件路径" "") || return 1
+    else
+      f="${choice}"
+    fi
+  fi
+  [[ -f "${f}" ]] || { tui_msg "错误" "文件不存在: ${f}"; return 1; }
+  if ! tui_yesno "确认恢复" "将用 ${f} 覆盖 /etc/xcc ，是否继续？"; then
+    return 1
+  fi
+  begin_config_op
+  tar -xzf "${f}" -C /etc
+  if [[ -f "${XCC_DIR}/export/xray-config.json" ]]; then
+    cp -a "${XCC_DIR}/export/xray-config.json" "${XRAY_CONF}"
+  fi
+  if [[ -d "${XCC_DIR}/export/hysteria" ]]; then
+    mkdir -p "${HYSTERIA_DIR}"
+    cp -a "${XCC_DIR}/export/hysteria/." "${HYSTERIA_DIR}/"
+  fi
+  chmod 600 "${XCC_NODES}" "${XCC_OUTBOUND}" "${XRAY_CONF}" 2>/dev/null || true
+  if apply_all_configs; then
+    end_config_op_ok
+    tui_msg "完成" "配置已恢复。"
+  else
+    tui_msg "错误" "恢复后语法检查失败，已回滚。"
+    end_config_op_fail
+  fi
+}
+
+#===============================================================================
+# 卸载
+#===============================================================================
+do_uninstall() {
+  local also
+  also="${1:-ask}"
+  systemctl stop xcc-watchdog >/dev/null 2>&1 || true
+  systemctl disable xcc-watchdog >/dev/null 2>&1 || true
+  if [[ "${also}" == "ask" ]]; then
+    if tui_yesno "卸载组件" "是否同时卸载 Xray 和 Hysteria？"; then
+      also="yes"
+    else
+      also="no"
+    fi
+  fi
+  if [[ "${also}" == "yes" ]]; then
+    systemctl stop xray >/dev/null 2>&1 || true
+    systemctl disable xray >/dev/null 2>&1 || true
+    systemctl list-units --full --all --type=service --no-legend 'hysteria@*' 2>/dev/null \
+      | awk '{print $1}' | while read -r unit; do
+          [[ -n "${unit}" ]] || continue
+          systemctl stop "${unit}" >/dev/null 2>&1 || true
+          systemctl disable "${unit}" >/dev/null 2>&1 || true
+        done
+    rm -f "${XRAY_BIN}" "${HYSTERIA_BIN}"
+    rm -rf /usr/local/etc/xray "${HYSTERIA_DIR}"
+  fi
+  rm -f "${WATCHDOG_UNIT}" "${HYSTERIA_UNIT}" "${LOGROTATE_CONF}"
+  systemctl daemon-reload || true
+  rm -rf "${XCC_DIR}" "${XCC_TMP_DIR}"
+  rm -f "${XCC_BIN}"
+  info "xcc 已卸载。"
+}
+
+menu_uninstall() {
+  local confirm
+  confirm=$(tui_input "卸载 xcc" "此操作不可撤销。请输入 yes 确认卸载" "") || return 1
+  if [[ "${confirm}" != "yes" ]]; then
+    tui_msg "已取消" "未输入 yes，未执行卸载。"
+    return 1
+  fi
+  do_uninstall ask
+  tui_msg "完成" "xcc 已卸载，即将退出。"
+  exit 0
+}
+
+cmd_uninstall() {
+  need_root
+  local confirm
+  read -r -p "确认卸载 xcc？请输入 yes: " confirm
+  if [[ "${confirm}" != "yes" ]]; then
+    echo "已取消。"
+    exit 1
+  fi
+  tui_init
+  do_uninstall ask
+}
+
+#===============================================================================
+# 更新：覆盖 /usr/local/bin/xcc，保留 /etc/xcc/
+# 若 TUI（xcc run）正在运行则拒绝；看门狗会临时停止以便覆盖二进制。
+#===============================================================================
+cmd_update() {
+  need_root
+  if pgrep -af "xcc run" | grep -v "$$" >/dev/null 2>&1; then
+    die "请先退出 xcc 再更新"
+  fi
+  # 字面检测 pgrep -f xcc：排除自身、update、watchdog
+  local others
+  others=$(pgrep -af "xcc" | grep -vE "($$|xcc update|xcc watchdog)" || true)
+  if [[ -n "${others}" ]] && pgrep -f "xcc run" >/dev/null 2>&1; then
+    die "请先退出 xcc 再更新"
+  fi
+  info "正在从 GitHub 下载最新 xcc..."
+  local tmp
+  tmp=$(xcc_mktemp)
+  if ! xcc_curl "${tmp}" "${XCC_RAW_BASE}/xcc"; then
+    die "下载失败，请重试。"
+  fi
+  systemctl stop xcc-watchdog >/dev/null 2>&1 || true
+  chmod 755 "${tmp}"
+  mv "${tmp}" "${XCC_BIN}"
+  chmod 755 "${XCC_BIN}"
+  systemctl start xcc-watchdog >/dev/null 2>&1 || true
+  info "更新完成。/etc/xcc/ 配置已保留。当前版本: $("${XCC_BIN}" version 2>/dev/null || echo unknown)"
+}
+
+check_remote_xcc_version() {
+  local remote
+  remote=$(xcc_curl_quick "${XCC_RAW_BASE}/xcc" 2>/dev/null \
+    | grep -m1 '^XCC_VERSION=' | cut -d= -f2 | tr -d '"')
+  [[ -n "${remote}" ]] || return 0
+  if version_newer "${remote}" "${XCC_VERSION}"; then
+    add_warning "GitHub 上有新版本 ${remote}（当前 ${XCC_VERSION}），可执行 xcc update 更新。"
+  fi
+}
+
+#===============================================================================
+# 看门狗主循环（每分钟一次）
+#===============================================================================
+watchdog_cleanup_old_logs() {
+  find /var/log/ -name "xcc.log.*" -mtime +7 -delete 2>/dev/null || true
+}
+
+watchdog_disk() {
+  local usage
+  usage=$(df -h / | awk 'NR==2{print $5}' | sed 's/%//')
+  if ! [[ "${usage}" =~ ^[0-9]+$ ]]; then
+    usage=$(df -P / | awk 'NR==2{print $5}' | sed 's/%//')
+  fi
+  if [[ "${usage}" =~ ^[0-9]+$ && "${usage}" -gt 85 ]]; then
+    xcc_log ERROR "磁盘使用率 ${usage}% 超过 85%"
+    broadcast "xcc 告警: 磁盘使用率 ${usage}% 超过 85%"
+  fi
+}
+
+watchdog_load() {
+  local load cores thr
+  load=$(uptime | awk -F'load average:' '{print $2}' | cut -d, -f1 | tr -d ' ')
+  cores=$(nproc 2>/dev/null || echo 1)
+  if command -v bc >/dev/null 2>&1 && [[ -n "${load}" ]]; then
+    thr=$(echo "${cores} * 2" | bc)
+    if [[ $(echo "${load} > ${thr}" | bc -l) -eq 1 ]]; then
+      xcc_log WARN "1 分钟负载 ${load} 超过阈值 ${thr}（CPU 核心数 ${cores} * 2）"
+    fi
+  fi
+}
+
+watchdog_count_recent_restarts() {
+  local now cutoff
+  now=$(date +%s)
+  cutoff=$((now - 300))
+  [[ -f "${WATCHDOG_RESTARTS}" ]] || { printf '0'; return; }
+  awk -v c="${cutoff}" '$1 >= c {n++} END {print n+0}' "${WATCHDOG_RESTARTS}"
+}
+
+watchdog_record_restart() {
+  mkdir -p "${XCC_DIR}"
+  date +%s >> "${WATCHDOG_RESTARTS}"
+  tail -n 30 "${WATCHDOG_RESTARTS}" > "${WATCHDOG_RESTARTS}.tmp" 2>/dev/null || true
+  mv "${WATCHDOG_RESTARTS}.tmp" "${WATCHDOG_RESTARTS}" 2>/dev/null || true
+}
+
+watchdog_check_xray() {
+  if [[ ! -x "${XRAY_BIN}" ]]; then
+    return 0
+  fi
+  if [[ -f "${WATCHDOG_HALT}" ]]; then
+    xcc_log ERROR "看门狗保护已触发（5 分钟内重启超过 3 次），等待人工介入。删除 ${WATCHDOG_HALT} 后恢复。"
+    return 0
+  fi
+  if is_svc_active xray; then
+    return 0
+  fi
+  local n
+  n=$(watchdog_count_recent_restarts)
+  if [[ "${n}" -ge 3 ]]; then
+    : > "${WATCHDOG_HALT}"
+    xcc_log ERROR "5 分钟内重启超过 3 次，已停止自动重启，请人工介入。"
+    broadcast "xcc 紧急告警: Xray 5 分钟内重启超过 3 次，已停止自动重启。"
+    return 0
+  fi
+  xcc_log WARN "Xray 未运行，正在 systemctl restart xray"
+  systemctl restart xray >/dev/null 2>&1 || true
+  watchdog_record_restart
+}
+
+watchdog_check_hysteria() {
+  local p
+  [[ -f "${XCC_NODES}" ]] || return 0
+  jq -r '.hysteria[]? | select(.enabled==true) | .port' "${XCC_NODES}" 2>/dev/null | while read -r p; do
+    [[ -n "${p}" ]] || continue
+    if ! is_svc_active "hysteria@${p}"; then
+      xcc_log WARN "Hysteria@${p} 未运行，正在重启"
+      systemctl restart "hysteria@${p}" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+watchdog_check_outbound() {
+  [[ -f "${XCC_OUTBOUND}" ]] || return 0
+  local url mode
+  url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
+  [[ -n "${url}" && "${url}" != DIRECT && "${url}" != direct ]] || return 0
+  parse_socks5 "${url}"
+  local proxy_url exit_ip
+  if [[ -n "${SOCKS_USER}" ]]; then
+    proxy_url="socks5h://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_HOST}:${SOCKS_PORT}"
+  else
+    proxy_url="socks5h://${SOCKS_HOST}:${SOCKS_PORT}"
+  fi
+  if ! curl -fL --max-time 15 -x "${proxy_url}" -o /dev/null -sS "https://www.google.com" >/dev/null 2>&1; then
+    xcc_log ERROR "SOCKS5 代理连通性检查失败（访问 google.com）"
+  fi
+  exit_ip=$(curl -fL --max-time 15 -x "${proxy_url}" -sS "${IPIFY_URL}" 2>/dev/null || true)
+  if [[ -n "${exit_ip}" && "${exit_ip}" != "${SOCKS_HOST}" ]]; then
+    xcc_log WARN "出口 IP ${exit_ip} 与代理地址 ${SOCKS_HOST} 不一致"
+  fi
+}
+
+cmd_watchdog() {
+  need_root
+  init_tmp
+  watchdog_cleanup_old_logs
+  xcc_log INFO "看门狗启动"
+  while true; do
+    watchdog_disk
+    watchdog_load
+    watchdog_check_xray
+    watchdog_check_hysteria
+    watchdog_check_outbound
+    sleep 60
+  done
+}
+
+#===============================================================================
+# 主菜单 / CLI
+#===============================================================================
+show_startup_warnings() {
+  if [[ "${#WARNINGS[@]}" -eq 0 ]]; then
+    return
+  fi
+  local msg="" w
+  for w in "${WARNINGS[@]}"; do
+    msg+="• ${w}"$'\n'
+  done
+  tui_msg "环境检测提示" "${msg}"
+}
+
+main_menu() {
+  local choice extra
+  extra=""
+  if [[ -f "${WATCHDOG_HALT}" ]]; then
+    extra=$'\n'"⚠ 看门狗保护已触发，Xray 不会自动重启。可选择重置。"
+  fi
+  while true; do
+    choice=$(tui_menu "xcc 主菜单" "请选择操作（仅支持单用户配置）${extra}" \
+      "1" "配置 Reality 节点" \
+      "2" "配置 Hysteria 节点" \
+      "3" "管理 Reality 节点" \
+      "4" "管理 Hysteria 节点" \
+      "5" "设置出站代理" \
+      "6" "设置新的 SSH 连接端口" \
+      "7" "备份配置" \
+      "8" "恢复配置" \
+      "9" "卸载 xcc" \
+      "r" "重置看门狗保护" \
+      "0" "退出") || exit 0
+    case "${choice}" in
+      1) menu_config_reality ;;
+      2) menu_config_hysteria ;;
+      3) menu_manage_reality ;;
+      4) menu_manage_hysteria ;;
+      5) menu_outbound ;;
+      6) menu_ssh_port ;;
+      7) menu_backup ;;
+      8) menu_restore ;;
+      9) menu_uninstall ;;
+      r)
+        rm -f "${WATCHDOG_HALT}" "${WATCHDOG_RESTARTS}"
+        extra=""
+        tui_msg "完成" "已重置看门狗保护。"
+        ;;
+      0) exit 0 ;;
+    esac
+  done
+}
+
+cmd_run() {
+  need_root
+  trap on_run_exit EXIT
+  trap 'exit 130' INT TERM
+  ensure_environment
+  check_remote_xcc_version
+  show_startup_warnings
+  if [[ -f "${WATCHDOG_HALT}" ]]; then
+    tui_msg "看门狗保护" "检测到 5 分钟内重启超过 3 次，自动重启已停止。主菜单可选择重置。"
+  fi
+  main_menu
+}
+
+cmd_version() {
+  printf 'xcc %s (config format %s)\n' "${XCC_VERSION}" "${XCC_CONFIG_FORMAT}"
+}
+
+usage() {
+  cat <<EOF
+xcc ${XCC_VERSION} - Xray / Hysteria 节点管理工具（仅支持单用户配置）
+
+Usage:
+  xcc              显示本帮助
+  xcc run          启动中文 TUI 管理界面
+  xcc update       从 GitHub 下载最新脚本覆盖 ${XCC_BIN}（保留 ${XCC_DIR}/）
+  xcc uninstall    卸载 xcc（需输入 yes 确认）
+  xcc version      显示版本
+  xcc watchdog     看门狗（由 systemd 调用，请勿手动前台运行）
+
+安装:
+  bash <(curl -fsSL ${XCC_RAW_BASE}/install.sh)
+
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "${cmd}" in
+    ""|-h|--help|help) usage ;;
+    run) cmd_run ;;
+    update) cmd_update ;;
+    uninstall) cmd_uninstall ;;
+    version|--version) cmd_version ;;
+    watchdog) cmd_watchdog ;;
+    *)
+      err "未知命令: ${cmd}"
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"

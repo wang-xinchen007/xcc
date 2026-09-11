@@ -1,0 +1,171 @@
+# xcc
+
+Xray Reality + Hysteria 节点管理工具（**仅支持单用户配置**）。
+
+一个 Bash 主脚本，通过 `xcc run` 进入中文 TUI（whiptail / dialog），覆盖节点配置、出站代理、SSH 端口、备份恢复、systemd 看门狗与日志自维护。
+
+目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+（次要）。依赖 systemd。
+
+## 功能介绍
+
+- 一键环境检测与依赖安装（curl、jq、unzip、bc、dialog、qrencode、apparmor-utils 等）
+- 按顺序安装：先依赖 → 再 `curl -f` 下载 Xray 官方脚本 → 最后执行安装（最新 TLS / Reality 版本）
+- 从 GitHub Release 安装最新 Hysteria 预编译二进制
+- 配置 / 管理 VLESS + Reality（TLS 1.3、`xtls-rprx-vision`、fingerprint=`chrome`）
+- 配置 / 管理 Hysteria 2（ACME 或自签名、salamander 混淆）
+- 节点级出站：Shifter（SOCKS5）或直连；路由顺序为 Hysteria → Reality → 默认出站
+- 修改 SSH 端口（备份、`sshd -t` 校验、防火墙放行、失败回滚）
+- 备份 / 恢复 `/etc/xcc`
+- systemd 看门狗：进程自愈、出口 IP 检查、磁盘 / 负载监控、日志轮转
+- **配置修改时自动暂停看门狗**，避免误重启；成功或失败后都会恢复
+
+## 安装命令
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/wang-xinchen007/xcc/main/install.sh)
+```
+
+手动安装：
+
+```bash
+curl -fL -o /usr/local/bin/xcc https://raw.githubusercontent.com/wang-xinchen007/xcc/main/xcc
+chmod 755 /usr/local/bin/xcc
+sudo xcc run
+```
+
+安装脚本会：检测系统 → 下载 `xcc` 到 `/usr/local/bin/xcc` → 创建 `/etc/xcc/` → 自动运行 `xcc run` 进入首次配置向导。
+
+## 使用方法
+
+```text
+xcc              显示帮助（Usage）
+xcc run          启动中文 TUI
+xcc update       从 GitHub 更新主脚本（保留 /etc/xcc/ 配置）
+xcc uninstall    卸载（需输入 yes 确认）
+xcc version      显示版本
+```
+
+`xcc run` 启动时会检查 GitHub 最新版本；若有新版本会提示执行 `xcc update`。
+
+更新前若检测到 TUI（`xcc run`）仍在运行，会提示：**请先退出 xcc 再更新**。
+
+## 使用截图（TUI 示意）
+
+```text
+┌────────────── xcc 1.0.0  |  仅支持单用户配置 ──────────────┐
+│ xcc 主菜单                                                 │
+│ 请选择操作（仅支持单用户配置）                             │
+│                                                            │
+│     1  配置 Reality 节点                                   │
+│     2  配置 Hysteria 节点                                  │
+│     3  管理 Reality 节点                                   │
+│     4  管理 Hysteria 节点                                  │
+│     5  设置出站代理                                        │
+│     6  设置新的 SSH 连接端口                               │
+│     7  备份配置                                            │
+│     8  恢复配置                                            │
+│     9  卸载 xcc                                            │
+│     r  重置看门狗保护                                      │
+│     0  退出                                                │
+│                                                            │
+│                    <确定>          <取消>                  │
+└────────────────────────────────────────────────────────────┘
+```
+
+配置修改时会出现：
+
+- 黄色：`⏸ 看门狗已暂停，配置修改期间不会自动重启 Xray`
+- 绿色：`▶ 看门狗已恢复运行`
+
+Reality 节点创建成功后，终端会打印 VLESS 分享链接，并用 `qrencode -t ansiutf8` 显示二维码。
+
+## 路径与配置
+
+| 用途 | 路径 |
+|------|------|
+| 主脚本 | `/usr/local/bin/xcc` |
+| xcc 配置 | `/etc/xcc/` |
+| 节点元数据 | `/etc/xcc/nodes.json` |
+| 出站代理 | `/etc/xcc/outbound.conf`（`SOCKS5://user:pass@ip:port` 或 `DIRECT`） |
+| 配置格式版本 | `/etc/xcc/version` |
+| Xray 配置 | `/usr/local/etc/xray/config.json` |
+| Hysteria 配置 | `/etc/hysteria/config.json` 与 `config-<端口>.json` |
+| 日志 | `/var/log/xcc.log` |
+| 备份 | `/root/xcc-backup-日期.tar.gz` |
+| 临时文件 | `/var/tmp/xcc-*`、`~/.cache/xcc/` |
+
+敏感文件权限为 `600`。
+
+## Reality 约定
+
+- 必须安装支持 XTLS/Reality 的最新 Xray（v1.8.0+）
+- `security=reality`，`tls=1.3`
+- `flow=xtls-rprx-vision`
+- `fingerprint=chrome`
+- 日志：`"log": {"loglevel": "warning"}`
+- 分享链接格式：
+
+```text
+vless://uuid@ip:port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=伪装域名&fp=chrome&pbk=公钥&sid=shortId#备注
+```
+
+## 看门狗
+
+服务名：`xcc-watchdog`（`Restart=always`，开机自启）。
+
+每分钟检查：
+
+- Xray / Hysteria 进程，异常则 `systemctl restart`
+- 从 `outbound.conf` 读取 SOCKS5，核对出口 IP（ipify），探测 google.com
+- 磁盘使用率 > 85%：ERROR + `wall`
+- 1 分钟负载 > CPU 核心数 × 2：WARN
+- 写入日志前若 `/var/log/xcc.log` > 50MB 则自行轮转
+- 启动时删除 7 天前的 `xcc.log.*`
+
+若 **5 分钟内重启超过 3 次**，停止自动重启并 `wall` 紧急告警，等待人工介入（TUI 中可「重置看门狗保护」）。
+
+配置 Reality / Hysteria、管理节点、设置出站、修改 SSH 端口、恢复配置时会 `systemctl stop xcc-watchdog`；完成后（含失败、取消、异常退出）自动 `systemctl start xcc-watchdog`。**备份配置不停止看门狗。** 暂停期间 Xray 继续处理流量。
+
+systemd 服务使用 `StandardOutput=null` 与 `StandardError=null`，避免 journal 占满磁盘。logrotate：每天 / 3 份 / 压缩 / `size 50M`，写入 `/etc/logrotate.d/xcc`。
+
+## Ubuntu 24.04+ 适配
+
+1. **systemd-resolved**：若运行，Xray DNS 使用 `https://1.1.1.1/dns-query` 与 `tcp://1.1.1.1:53`，避开 `127.0.0.53`
+2. **ufw**：改 SSH 端口时先 `ufw allow 新端口/tcp`，改完 `ufw reload`；inactive 则跳过
+3. **防火墙顺序**：nftables → ufw → firewalld → iptables
+4. **AppArmor**：安装后扫描 syslog，若有拒绝记录则 `aa-complain /usr/local/bin/xray`
+5. **unattended-upgrades**：启用时提示排除 Xray
+6. **cloud-init**：存在 `/etc/cloud/cloud.cfg` 时提示禁用网络管理
+7. **NTP**：未同步则 `timedatectl set-ntp true`
+8. **临时目录**：不使用可能 `noexec` 的 `/tmp`
+9. **旧版 Xray**：存在 `/etc/xray/` 时提示 `apt purge xray -y`
+10. **NetworkManager**：运行时提示纯服务器环境建议禁用
+
+所有 `apt` 命令前设置 `export DEBIAN_FRONTEND=noninteractive`。
+
+## 常见问题
+
+**Q: 提示「请先退出 xcc 再更新」？**  
+A: 先在 TUI 选「退出」，再执行 `xcc update`。看门狗会在更新时短暂停止。
+
+**Q: Reality 连不上？**  
+A: 确认系统时间已 NTP 同步；`dest` 应对应一个支持 TLS 1.3 / HTTP2 的目标（默认 `www.microsoft.com:443`）；客户端 SNI 与公钥、shortId 需一致。
+
+**Q: 配置修改后 Xray 被看门狗重启？**  
+A: 请走 TUI 菜单修改。脚本会暂停看门狗，语法检查通过后再恢复。
+
+**Q: 包管理器里的 xray 能不能用？**  
+A: 官方脚本失败时才会降级用 apt/yum。仓库版本往往过旧，不支持最新 Reality，不推荐。
+
+**Q: 是否支持多用户？**  
+A: 不支持。xcc **仅支持单用户配置**。
+
+**Q: 卸载会删除 Xray 吗？**  
+A: 默认询问「是否同时卸载 Xray 和 Hysteria？」。卸载 xcc 前必须输入 `yes`。
+
+**Q: TUI 打不开？**  
+A: 检测顺序为 whiptail → dialog；都没有会尝试安装 whiptail；仍失败则降级为 `read -p` 命令行。
+
+## 许可证
+
+MIT
