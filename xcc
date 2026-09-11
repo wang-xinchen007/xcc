@@ -22,7 +22,7 @@ NC='\033[0m'
 #-------------------------------------------------------------------------------
 # 版本与仓库
 #-------------------------------------------------------------------------------
-XCC_VERSION="2.0.0"
+XCC_VERSION="2.0.1"
 XCC_CONFIG_FORMAT="2"
 XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
 XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
@@ -137,8 +137,15 @@ init_tmp() {
 }
 
 xcc_mktemp() {
+  local suffix="${1:-}" f
   init_tmp
-  mktemp "${XCC_TMP_DIR}/xcc-XXXXXX"
+  f=$(mktemp "${XCC_TMP_DIR}/xcc-XXXXXX")
+  if [[ -n "${suffix}" ]]; then
+    mv "${f}" "${f}${suffix}"
+    printf '%s' "${f}${suffix}"
+  else
+    printf '%s' "${f}"
+  fi
 }
 
 # 使用 curl -f；失败时删除不完整文件并提示重试。
@@ -1216,18 +1223,27 @@ public_ip() {
     || hostname -I 2>/dev/null | awk '{print $1}'
 }
 
-# Xray 语法检查：优先 run -test，失败则降级 -test。
+# Xray 语法检查：优先 run -test。Xray 26+ 必须用 .json 后缀才能识别格式。
+XRAY_TEST_ERR=""
 xray_test_config() {
   local cfg="${1:-${XRAY_CONF}}"
-  local out
-  if "${XRAY_BIN}" run -test -config "${cfg}" >/dev/null 2>&1; then
+  local json_cfg="${cfg}" tmp=""
+  XRAY_TEST_ERR=""
+  if [[ "${cfg}" != *.json ]]; then
+    tmp=$(xcc_mktemp .json)
+    cp -a "${cfg}" "${tmp}"
+    json_cfg="${tmp}"
+  fi
+  if "${XRAY_BIN}" run -test -config "${json_cfg}" >/dev/null 2>&1 \
+    || "${XRAY_BIN}" run -test -format json -config "${json_cfg}" >/dev/null 2>&1 \
+    || "${XRAY_BIN}" -test -config "${json_cfg}" >/dev/null 2>&1; then
+    [[ -n "${tmp}" ]] && rm -f "${tmp}"
     return 0
   fi
-  if "${XRAY_BIN}" -test -config "${cfg}" >/dev/null 2>&1; then
-    return 0
-  fi
-  out=$("${XRAY_BIN}" run -test -config "${cfg}" 2>&1 | tail -n 20 || true)
-  err "${out}"
+  XRAY_TEST_ERR=$("${XRAY_BIN}" run -test -format json -config "${json_cfg}" 2>&1 | tail -n 30 || true)
+  [[ -z "${XRAY_TEST_ERR}" ]] && XRAY_TEST_ERR=$("${XRAY_BIN}" run -test -config "${json_cfg}" 2>&1 | tail -n 30 || true)
+  err "${XRAY_TEST_ERR}"
+  [[ -n "${tmp}" ]] && rm -f "${tmp}"
   return 1
 }
 
@@ -1294,9 +1310,9 @@ apply_xray_config() {
   fi
 
   node_json=$(cat "${XCC_NODES}")
-  tmp=$(xcc_mktemp)
+  tmp=$(xcc_mktemp .json)
 
-  jq -n \
+  if ! jq -n \
     --argjson dns "${dns_json}" \
     --argjson nodes "${node_json}" \
     --argjson proxy "${proxy_json}" \
@@ -1332,7 +1348,7 @@ apply_xray_config() {
           decryption: "none"
         },
         streamSettings: {
-          network: "tcp", security: "reality", tls: "1.3",
+          network: "tcp", security: "reality",
           realitySettings: {
             show: false, dest: .dest, xver: 0,
             serverNames: [.sni], privateKey: .private_key,
@@ -1423,10 +1439,17 @@ apply_xray_config() {
              ] else [] end)
       }
     }
-    ' > "${tmp}"
+    ' > "${tmp}"; then
+    err "jq 生成 Xray 配置失败，请检查 /etc/xcc/nodes.json"
+    tui_msg "配置生成失败" "jq 无法生成 Xray JSON，请检查 nodes.json 是否损坏。"
+    rm -f "${tmp}"
+    return 1
+  fi
 
   if ! xray_test_config "${tmp}"; then
     err "Xray 配置语法检查失败，已拒绝写入。"
+    printf '%s\n' "${XRAY_TEST_ERR:-未知错误}" > "${XCC_TMP_DIR}/xray-test-err.txt"
+    tui_textbox_file "Xray 配置检查失败（已拒绝写入）" "${XCC_TMP_DIR}/xray-test-err.txt"
     rm -f "${tmp}"
     return 1
   fi
@@ -1470,7 +1493,7 @@ write_hysteria_node_config() {
   sni=$(printf '%s' "${json}" | jq -r '.sni // .domain // "localhost"')
   outbound=$(printf '%s' "${json}" | jq -r '.outbound // "proxy"')
   cfg="${HYSTERIA_DIR}/config-${port}.json"
-  tmp=$(xcc_mktemp)
+  tmp=$(xcc_mktemp .json)
   ob=$(hysteria_outbound_json "${outbound}")
 
   if [[ "${acme}" == "true" ]]; then
