@@ -2,7 +2,7 @@
 #===============================================================================
 #  xcc install.sh
 #  Author : xcc
-#  Version: 2.0.2
+#  Version: 2.1.0
 #  Description: 从 GitHub 部署 xcc 到 /usr/local/bin/xcc，并启动首次配置向导
 #===============================================================================
 
@@ -82,7 +82,7 @@ download_file() {
   while IFS= read -r url; do
     [[ -n "${url}" ]] || continue
     info "尝试下载: ${url}"
-    if curl -fL -A "xcc-install/2.0.2" --connect-timeout 8 --max-time 90 -o "${dest}" "${url}"; then
+    if curl -fL -A "xcc-install/2.1.0" --connect-timeout 8 --max-time 90 -o "${dest}" "${url}"; then
       return 0
     fi
     rm -f "${dest}"

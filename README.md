@@ -1,16 +1,17 @@
 # xcc
 
-Xray 多协议节点管理工具（**单机单用户**）。TUI 参考 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 的菜单流，能力参考 [3x-ui](https://github.com/MHSanaei/3x-ui) 的入站 / 流量 / 订阅 / 分流，全部收敛在一个 Bash 脚本里。
+Xray / **sing-box** / **Nginx** 多协议节点管理工具（**单机单用户**）。TUI 参考 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 的菜单流，能力参考 [3x-ui](https://github.com/MHSanaei/3x-ui) 的入站 / 流量 / 订阅 / 分流，全部收敛在一个 Bash 脚本里。
 
-目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+。依赖 systemd。当前版本 **2.0.2**。
+目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+。依赖 systemd。当前版本 **2.1.0**。
 
 ## 功能介绍
 
-- 状态面板：CPU / 内存 / 磁盘 / 负载 / 公网 IP / 服务状态 / Xray Stats 流量
+- 状态面板：CPU / 内存 / 磁盘 / 负载 / 公网 IP / Xray、sing-box、Nginx 状态 / Xray Stats 流量
 - 一键无域名 Reality（默认 `download-installer.cdn.mozilla.net` 伪装，与 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 相同 `sid=6ba85179e30d4fc2` / `fp=chrome` / `flow=xtls-rprx-vision`）
-- 协议：VLESS Reality、VLESS-WS-TLS、VMess-WS-TLS、Trojan-TLS、Shadowsocks 2022、Hysteria2
+- 协议：VLESS Reality、VLESS-WS-TLS、VMess-WS-TLS、Trojan-TLS、Shadowsocks 2022、Hysteria2（**SagerNet sing-box**，与 v2ray-agent 相同 inbound）
+- Nginx：TLS 反代 WebSocket、ACME webroot、站点伪装（`www.python.org`）、HTTPS 订阅
 - ACME（Let's Encrypt / acme.sh）或自签名证书
-- 通用订阅（base64 HTTP）+ Clash Meta YAML 订阅 + 分享链接 / 二维码
+- 通用订阅（base64）+ Clash Meta YAML 订阅 + 分享链接 / 二维码
 - 出站：SOCKS5（Shifter）、直连、Cloudflare WARP（wgcf → Xray wireguard）
 - 分流：BT 阻断、广告拦截、国内直连、域名黑名单
 - BBR 加速、SSH 端口、备份恢复、核心更新
@@ -65,7 +66,7 @@ xcc version      显示版本
 ## 使用截图（TUI 示意）
 
 ```text
-┌────────────── xcc 2.0.2  |  仅支持单用户配置 ──────────────┐
+┌────────────── xcc 2.1.0  |  仅支持单用户配置 ──────────────┐
 │ xcc 主菜单                                                 │
 │                                                            │
 │     d  状态面板 / 流量                                     │
@@ -88,7 +89,7 @@ xcc version      显示版本
 
 配置修改时会出现：
 
-- 黄色：`⏸ 看门狗已暂停，配置修改期间不会自动重启 Xray`
+- 黄色：`⏸ 看门狗已暂停，配置修改期间不会自动重启 Xray / sing-box / Nginx`
 - 绿色：`▶ 看门狗已恢复运行`
 
 Reality 节点创建成功后，终端会打印 VLESS 分享链接，并用 `qrencode -t ansiutf8` 显示二维码。
@@ -103,12 +104,24 @@ Reality 节点创建成功后，终端会打印 VLESS 分享链接，并用 `qre
 | 出站代理 | `/etc/xcc/outbound.conf`（`SOCKS5://user:pass@ip:port` 或 `DIRECT`） |
 | 配置格式版本 | `/etc/xcc/version` |
 | Xray 配置 | `/usr/local/etc/xray/config.json` |
-| Hysteria 配置 | `/etc/hysteria/config.json` 与 `config-<端口>.json` |
+| sing-box（Hysteria2） | `/usr/local/bin/sing-box`，配置 `/etc/xcc/sing-box/conf/config.json` |
+| Nginx 站点 | `/etc/nginx/conf.d/xcc.conf`，webroot `/etc/xcc/www` |
+| 订阅文件 | `/etc/xcc/subscribe/`（有域名证书时：`https://域名:443/s/TOKEN`） |
 | 日志 | `/var/log/xcc.log` |
 | 备份 | `/root/xcc-backup-日期.tar.gz` |
 | 临时文件 | `/var/tmp/xcc-*`、`~/.cache/xcc/` |
 
 敏感文件权限为 `600`。
+
+## Nginx 与 sing-box（对齐 v2ray-agent）
+
+- **Hysteria2** 不再使用官方 `apernet/hysteria` 二进制，改为 [SagerNet/sing-box](https://github.com/SagerNet/sing-box)。systemd 单元：`sing-box.service`（`sing-box run -c /etc/xcc/sing-box/conf/config.json`）。
+- inbound：`type=hysteria2`，`listen=::`，`up_mbps=100` / `down_mbps=50`，`alpn=h3`；可选 `obfs.salamander`。有 SOCKS5 出站时 hy2 入站走 `socks5_outbound`。
+- 旧版 `hysteria@端口` 会在应用配置时停止并删除。
+- **Nginx** 监听 80 做 ACME webroot；有域名证书后在 `nginx_port`（默认 443）上 `listen N ssl http2`（Ubuntu 24.04 的 nginx 1.24 写法）。
+- VLESS-WS / VMess 由 Nginx 反代到本机 `127.0.0.1:31297` / `31299`，Xray 对应 inbound 为 `security=none`。
+- 根路径伪装反代 `https://www.python.org`；订阅：`https://域名:443/s/TOKEN` 与 `https://域名:443/s/TOKEN.clash.yaml`。无证书时订阅走 HTTP `sub_port`（默认 2096）。
+- Hysteria2 默认 UDP 443，可与 Nginx TCP 443 并存。Reality 不要再占用同一 TCP 443。
 
 ## Reality 约定
 
@@ -140,7 +153,7 @@ hysteria2://密码@host:port?peer=host&insecure=0&sni=host&alpn=h3#备注
 
 每分钟检查：
 
-- Xray / Hysteria 进程，异常则 `systemctl restart`
+- Xray / sing-box（有 Hysteria2 节点时）/ Nginx 进程，异常则 `systemctl restart`
 - 从 `outbound.conf` 读取 SOCKS5，核对出口 IP（ipify），探测 google.com
 - 磁盘使用率 > 85%：ERROR + `wall`
 - 1 分钟负载 > CPU 核心数 × 2：WARN
@@ -149,7 +162,7 @@ hysteria2://密码@host:port?peer=host&insecure=0&sni=host&alpn=h3#备注
 
 若 **5 分钟内重启超过 3 次**，停止自动重启并 `wall` 紧急告警，等待人工介入（TUI 中可「重置看门狗保护」）。
 
-配置 Reality / Hysteria、管理节点、设置出站、修改 SSH 端口、恢复配置时会 `systemctl stop xcc-watchdog`；完成后（含失败、取消、异常退出）自动 `systemctl start xcc-watchdog`。**备份配置不停止看门狗。** 暂停期间 Xray 继续处理流量。
+配置 Reality / Hysteria2 / Nginx、管理节点、设置出站、修改 SSH 端口、恢复配置时会 `systemctl stop xcc-watchdog`；完成后（含失败、取消、异常退出）自动 `systemctl start xcc-watchdog`。**备份配置不停止看门狗。** 暂停期间现有连接继续处理流量。
 
 systemd 服务使用 `StandardOutput=null` 与 `StandardError=null`，避免 journal 占满磁盘。logrotate：每天 / 3 份 / 压缩 / `size 50M`，写入 `/etc/logrotate.d/xcc`。
 
@@ -193,7 +206,7 @@ A: 官方脚本失败时才会降级用 apt/yum。仓库版本往往过旧，不
 A: 不支持。xcc **仅支持单用户配置**。
 
 **Q: 卸载会删除 Xray 吗？**  
-A: 默认询问「是否同时卸载 Xray 和 Hysteria？」。卸载 xcc 前必须输入 `yes`。
+A: 默认询问「是否同时卸载 Xray、sing-box，并移除 Nginx 站点配置？」。卸载 xcc 前必须输入 `yes`。不会 `apt purge nginx`。
 
 **Q: TUI 打不开？**  
 A: 检测顺序为 whiptail → dialog；都没有会尝试安装 whiptail；仍失败则降级为 `read -p` 命令行。

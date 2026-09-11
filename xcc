@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 #===============================================================================
-#  xcc - Xray / Hysteria 节点管理工具
+#  xcc - Xray / sing-box / Nginx 节点管理工具
 #  Author : xcc
-#  Version: 2.0.2
-#  Description: 单用户 Reality + Hysteria 节点管理（中文 TUI）
+#  Version: 2.1.0
+#  Description: 单用户 Reality + sing-box Hysteria2 + Nginx 节点管理（中文 TUI）
 #               仅支持单用户配置。目标系统：Ubuntu 24.04+ / Debian 12+ / CentOS 9+
 #===============================================================================
 
@@ -22,7 +22,7 @@ NC='\033[0m'
 #-------------------------------------------------------------------------------
 # 版本与仓库
 #-------------------------------------------------------------------------------
-XCC_VERSION="2.0.2"
+XCC_VERSION="2.1.0"
 XCC_CONFIG_FORMAT="2"
 XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
 XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
@@ -45,13 +45,22 @@ XCC_TMP_DIR="/var/tmp/xcc"
 XCC_CACHE_DIR="${HOME}/.cache/xcc"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF="/usr/local/etc/xray/config.json"
-HYSTERIA_BIN="/usr/local/bin/hysteria"
-HYSTERIA_DIR="/etc/hysteria"
-HYSTERIA_CONF="${HYSTERIA_DIR}/config.json"
+SINGBOX_BIN="/usr/local/bin/sing-box"
+SINGBOX_DIR="${XCC_DIR}/sing-box"
+SINGBOX_CONF_DIR="${SINGBOX_DIR}/conf"
+SINGBOX_FRAG_DIR="${SINGBOX_CONF_DIR}/config"
+SINGBOX_CONF="${SINGBOX_CONF_DIR}/config.json"
+NGINX_WWW="${XCC_DIR}/www"
+NGINX_CONF="/etc/nginx/conf.d/xcc.conf"
+XRAY_VLESS_WS_LOCAL=31297
+XRAY_VMESS_WS_LOCAL=31299
+HYSTERIA_BIN="${SINGBOX_BIN}"
+HYSTERIA_DIR="${SINGBOX_DIR}"
+HYSTERIA_CONF="${SINGBOX_CONF}"
 XCC_CERT_DIR="${XCC_DIR}/certs"
 XCC_SUB_DIR="${XCC_DIR}/subscribe"
 XCC_WARP_FILE="${XCC_DIR}/warp.json"
-XCC_SETTINGS_DEFAULT='{"block_bt":true,"block_ads":false,"cn_direct":false,"domain_block":[],"sub_token":"","sub_port":2096,"cert":"","key":"","domain":"","warp":false,"hy_up_mbps":100,"hy_down_mbps":50}'
+XCC_SETTINGS_DEFAULT='{"block_bt":true,"block_ads":false,"cn_direct":false,"domain_block":[],"sub_token":"","sub_port":2096,"nginx_port":443,"cert":"","key":"","domain":"","warp":false,"hy_up_mbps":100,"hy_down_mbps":50}'
 # 与 v2ray-agent 重合的 Reality / Hysteria2 默认值（分享链接、shortId、伪装站必须一致）
 REALITY_DEFAULT_SID="6ba85179e30d4fc2"
 REALITY_DEFAULT_SNI="download-installer.cdn.mozilla.net"
@@ -64,12 +73,14 @@ WATCHDOG_HALT="${XCC_DIR}/.watchdog-halt"
 WATCHDOG_RESTARTS="${XCC_DIR}/.watchdog-restarts"
 LOGROTATE_CONF="/etc/logrotate.d/xcc"
 WATCHDOG_UNIT="/etc/systemd/system/xcc-watchdog.service"
-HYSTERIA_UNIT="/etc/systemd/system/hysteria@.service"
+SINGBOX_UNIT="/etc/systemd/system/sing-box.service"
+HYSTERIA_UNIT="${SINGBOX_UNIT}"
 SSHD_CONFIG="/etc/ssh/sshd_config"
 
 XRAY_INSTALL_URL="https://github.com/XTLS/Xray-install/raw/main/install-release.sh"
 XRAY_RELEASE_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
-HYSTERIA_RELEASE_API="https://api.github.com/repos/apernet/hysteria/releases/latest"
+SINGBOX_RELEASE_API="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+HYSTERIA_RELEASE_API="${SINGBOX_RELEASE_API}"
 IPIFY_URL="https://api.ipify.org"
 
 #-------------------------------------------------------------------------------
@@ -313,7 +324,7 @@ ensure_deps() {
 
   detect_os
 
-  pkgs=(curl jq unzip bc openssl ca-certificates python3)
+  pkgs=(curl jq unzip tar bc openssl ca-certificates nginx)
   if [[ "${PKG_MGR}" == "apt" ]]; then
     pkgs+=(dialog qrencode whiptail apparmor-utils)
   else
@@ -769,10 +780,10 @@ fw_delete_tcp() {
 # 目录、版本、节点 JSON
 #===============================================================================
 ensure_dirs() {
-  mkdir -p "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${HYSTERIA_DIR}" \
-    "${XCC_CERT_DIR}" "${XCC_SUB_DIR}" \
+  mkdir -p "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${SINGBOX_FRAG_DIR}" \
+    "${XCC_CERT_DIR}" "${XCC_SUB_DIR}" "${NGINX_WWW}/.well-known/acme-challenge" \
     "$(dirname "${XRAY_CONF}")" "${XCC_TMP_DIR}" "${XCC_CACHE_DIR}"
-  chmod 700 "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${HYSTERIA_DIR}" "${XCC_CERT_DIR}"
+  chmod 700 "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${SINGBOX_DIR}" "${XCC_CERT_DIR}"
   if [[ ! -f "${XCC_NODES}" ]]; then
     printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vmess":[],"trojan":[],"shadowsocks":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${XCC_NODES}"
     chmod 600 "${XCC_NODES}"
@@ -818,8 +829,8 @@ migrate_nodes_json() {
           | .up_mbps = (.up_mbps // $st.hy_up_mbps // 100)
           | .down_mbps = (.down_mbps // $st.hy_down_mbps // 50)
         ]
-      | .vless_ws = [ .vless_ws[] | .email = (.email // .tag // "xcc") | .host = (.host // .sni // "") ]
-      | .vmess = [ .vmess[] | .email = (.email // .tag // "xcc") | .network = (.network // "ws") ]
+      | .vless_ws = [ .vless_ws[] | .email = (.email // .tag // "xcc") | .host = (.host // .sni // "") | .xray_port = (.xray_port // 31297) ]
+      | .vmess = [ .vmess[] | .email = (.email // .tag // "xcc") | .network = (.network // "ws") | .xray_port = (.xray_port // 31299) ]
       | .trojan = [ .trojan[] | .email = (.email // .tag // "xcc") | .network = (.network // "tcp") ]
     ' 2>/dev/null || true
 }
@@ -877,7 +888,7 @@ pause_watchdog() {
   if is_svc_active xcc-watchdog; then
     systemctl stop xcc-watchdog
     WATCHDOG_PAUSED=1
-    tui_infobox "⏸ 看门狗已暂停，配置修改期间不会自动重启 Xray"
+    tui_infobox "⏸ 看门狗已暂停，配置修改期间不会自动重启 Xray / sing-box / Nginx"
     xcc_log INFO "看门狗已暂停（配置修改）"
   else
     WATCHDOG_PAUSED=0
@@ -946,7 +957,10 @@ backup_runtime_configs() {
   cp -a "${XCC_NODES}" "${dest}/nodes.json" 2>/dev/null || true
   cp -a "${XCC_OUTBOUND}" "${dest}/outbound.conf" 2>/dev/null || true
   cp -a "${XRAY_CONF}" "${dest}/xray.json" 2>/dev/null || true
-  cp -a "${HYSTERIA_DIR}" "${dest}/hysteria" 2>/dev/null || true
+  if [[ -d "${SINGBOX_DIR}" ]]; then
+    cp -a "${SINGBOX_DIR}" "${dest}/sing-box" 2>/dev/null || true
+    cp -a "${SINGBOX_DIR}" "${dest}/hysteria" 2>/dev/null || true
+  fi
   cp -a "${SSHD_CONFIG}" "${dest}/sshd_config" 2>/dev/null || true
   printf '%s' "${dest}"
 }
@@ -958,9 +972,12 @@ restore_backup_dir() {
   [[ -f "${dest}/outbound.conf" ]] && cp -a "${dest}/outbound.conf" "${XCC_OUTBOUND}"
   [[ -f "${dest}/xray.json" ]] && cp -a "${dest}/xray.json" "${XRAY_CONF}"
   [[ -f "${dest}/sshd_config" ]] && cp -a "${dest}/sshd_config" "${SSHD_CONFIG}"
-  if [[ -d "${dest}/hysteria" ]]; then
-    mkdir -p "${HYSTERIA_DIR}"
-    cp -a "${dest}/hysteria/." "${HYSTERIA_DIR}/"
+  if [[ -d "${dest}/sing-box" ]]; then
+    mkdir -p "${SINGBOX_DIR}"
+    cp -a "${dest}/sing-box/." "${SINGBOX_DIR}/"
+  elif [[ -d "${dest}/hysteria" ]]; then
+    mkdir -p "${SINGBOX_DIR}"
+    cp -a "${dest}/hysteria/." "${SINGBOX_DIR}/"
   fi
 }
 
@@ -969,7 +986,17 @@ restore_backup_dir() {
 #===============================================================================
 port_busy_ss() {
   local port="$1"
-  ss -H -tuln 2>/dev/null | awk '{print $5}' | grep -Eq ":${port}$"
+  port_busy_tcp "${port}" || port_busy_udp "${port}"
+}
+
+port_busy_tcp() {
+  local port="$1"
+  ss -H -ltn 2>/dev/null | grep -Eq ":${port}([^0-9]|$)"
+}
+
+port_busy_udp() {
+  local port="$1"
+  ss -H -lun 2>/dev/null | grep -Eq ":${port}([^0-9]|$)"
 }
 
 port_used_by_nodes() {
@@ -977,6 +1004,24 @@ port_used_by_nodes() {
   local skip_tag="${2:-}"
   jq -r --arg skip "${skip_tag}" --argjson port "${port}" '
     (.reality[]? | select(.tag != $skip) | .port),
+    (.trojan[]? | select(.tag != $skip) | .port),
+    (.shadowsocks[]? | select(.tag != $skip) | .port)
+  ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}" && return 0
+  if nginx_front_enabled; then
+    [[ "$(nginx_public_port)" == "${port}" ]] && return 0
+  else
+    jq -r --arg skip "${skip_tag}" --argjson port "${port}" '
+      (.vless_ws[]? | select(.tag != $skip) | .port),
+      (.vmess[]? | select(.tag != $skip) | .port)
+    ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}" && return 0
+  fi
+  return 1
+}
+
+udp_port_used_by_nodes() {
+  local port="$1"
+  local skip_tag="${2:-}"
+  jq -r --arg skip "${skip_tag}" --argjson port "${port}" '
     (.hysteria[]? | select(.tag != $skip) | .port)
   ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}"
 }
@@ -989,18 +1034,61 @@ assert_port_free() {
     return 1
   fi
   if port_used_by_nodes "${port}" "${skip_tag}"; then
-    tui_msg "端口占用" "端口 ${port} 已被 xcc 节点使用，请更换端口。"
+    tui_msg "端口占用" "端口 ${port} 已被 xcc 节点或 Nginx 使用，请更换端口。"
     return 1
   fi
-  if port_busy_ss "${port}"; then
-    tui_msg "端口占用" "检测到端口 ${port} 已被占用（ss -tuln），请更换端口。"
+  if port_busy_tcp "${port}"; then
+    tui_msg "端口占用" "检测到 TCP 端口 ${port} 已被占用（ss -tln），请更换端口。"
+    return 1
+  fi
+  return 0
+}
+
+assert_udp_port_free() {
+  local port="$1"
+  local skip_tag="${2:-}"
+  if ! [[ "${port}" =~ ^[0-9]+$ ]] || [[ "${port}" -lt 1 || "${port}" -gt 65535 ]]; then
+    tui_msg "错误" "端口无效: ${port}"
+    return 1
+  fi
+  if udp_port_used_by_nodes "${port}" "${skip_tag}"; then
+    tui_msg "端口占用" "UDP 端口 ${port} 已被 Hysteria2 使用，请更换端口。"
+    return 1
+  fi
+  if port_busy_udp "${port}"; then
+    tui_msg "端口占用" "检测到 UDP 端口 ${port} 已被占用（ss -uln），请更换端口。"
+    return 1
+  fi
+  return 0
+}
+
+# Nginx 公网 TLS 端口：可复用本机已有的 xcc Nginx，但不能和 Reality/Trojan/SS 抢 TCP。
+assert_nginx_listen_port() {
+  local port="$1"
+  if ! [[ "${port}" =~ ^[0-9]+$ ]] || [[ "${port}" -lt 1 || "${port}" -gt 65535 ]]; then
+    tui_msg "错误" "端口无效: ${port}"
+    return 1
+  fi
+  if jq -r --argjson port "${port}" '
+      (.reality[]? | .port),
+      (.trojan[]? | .port),
+      (.shadowsocks[]? | .port)
+    ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}"; then
+    tui_msg "端口占用" "TCP ${port} 已被 Reality / Trojan / Shadowsocks 占用，Nginx 无法共用。请换端口。"
+    return 1
+  fi
+  if port_busy_tcp "${port}"; then
+    if [[ -f "${NGINX_CONF}" ]] && grep -Eq "listen[[:space:]]+(\\[::\\]:)?${port}[[:space:]]" "${NGINX_CONF}"; then
+      return 0
+    fi
+    tui_msg "端口占用" "检测到 TCP 端口 ${port} 已被占用（ss -tln），请更换 Nginx 端口。"
     return 1
   fi
   return 0
 }
 
 #===============================================================================
-# Xray / Hysteria 安装（必须先依赖，再 curl -f 下载，再执行）
+# Xray / sing-box / Nginx 安装（必须先依赖，再 curl -f 下载，再执行）
 #===============================================================================
 arch_suffix() {
   case "$(uname -m)" in
@@ -1018,8 +1106,12 @@ xray_installed_version() {
 }
 
 hysteria_installed_version() {
-  if [[ -x "${HYSTERIA_BIN}" ]]; then
-    "${HYSTERIA_BIN}" version 2>/dev/null | head -n1 | awk '{print $NF}' | tr -d ','
+  singbox_installed_version
+}
+
+singbox_installed_version() {
+  if [[ -x "${SINGBOX_BIN}" ]]; then
+    "${SINGBOX_BIN}" version 2>/dev/null | awk '/sing-box version/{print $3; exit}'
   fi
 }
 
@@ -1098,15 +1190,36 @@ install_xray() {
 }
 
 install_hysteria() {
-  local latest installed arch url tmp
-  latest=$(github_latest_tag "${HYSTERIA_RELEASE_API}" || true)
-  installed=$(hysteria_installed_version || true)
-  arch=$(arch_suffix)
+  install_singbox
+}
 
-  if [[ -x "${HYSTERIA_BIN}" ]]; then
-    info "已安装 Hysteria ${installed:-unknown}，最新版本 ${latest:-unknown}"
+singbox_arch_tuple() {
+  case "$(uname -m)" in
+    x86_64|amd64) printf 'linux-amd64' ;;
+    aarch64|arm64) printf 'linux-arm64' ;;
+    armv7l) printf 'linux-armv7' ;;
+    *) printf 'linux-amd64' ;;
+  esac
+}
+
+github_release_urls() {
+  local rel="$1"
+  printf '%s\n' \
+    "https://github.com/${rel}" \
+    "https://ghproxy.net/https://github.com/${rel}" \
+    "https://mirror.ghproxy.com/https://github.com/${rel}"
+}
+
+install_singbox() {
+  local latest installed arch ver url tmp dir
+  latest=$(github_latest_tag "${SINGBOX_RELEASE_API}" || true)
+  installed=$(singbox_installed_version || true)
+  arch=$(singbox_arch_tuple)
+
+  if [[ -x "${SINGBOX_BIN}" ]]; then
+    info "已安装 sing-box ${installed:-unknown}，最新版本 ${latest:-unknown}"
     if [[ -n "${latest}" ]] && version_newer "${latest}" "${installed}"; then
-      if ! tui_yesno "Hysteria 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级？"; then
+      if ! tui_yesno "sing-box 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级？"; then
         return 0
       fi
     else
@@ -1114,22 +1227,69 @@ install_hysteria() {
     fi
   fi
 
-  info "正在从 GitHub Release 安装 Hysteria..."
-  url="https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${arch}"
+  ver="${latest#v}"
+  [[ -n "${ver}" ]] || ver="1.12.12"
+  latest="${latest:-v${ver}}"
+  info "正在从 GitHub Release 安装 sing-box ${latest} ..."
   tmp=$(xcc_mktemp)
-  if ! xcc_curl "${tmp}" "${url}"; then
-    warn "GitHub 下载 Hysteria 失败，尝试包管理器。"
-    pkg_install hysteria || return 1
-    link_binary "${HYSTERIA_BIN}" hysteria
+  url=""
+  while IFS= read -r url; do
+    [[ -n "${url}" ]] || continue
+    info "尝试下载: ${url}"
+    if curl -fL -A "xcc/${XCC_VERSION}" --connect-timeout 15 --max-time 180 -o "${tmp}" "${url}"; then
+      break
+    fi
+    rm -f "${tmp}"
+    tmp=$(xcc_mktemp)
+    url=""
+  done < <(github_release_urls "SagerNet/sing-box/releases/download/${latest}/sing-box-${ver}-${arch}.tar.gz")
+  if [[ ! -s "${tmp}" ]]; then
+    err "下载 sing-box 失败"
+    return 1
+  fi
+  dir=$(mktemp -d "${XCC_TMP_DIR}/singbox-XXXXXX")
+  if ! tar -xzf "${tmp}" -C "${dir}"; then
+    rm -rf "${dir}" "${tmp}"
+    err "解压 sing-box 失败"
+    return 1
+  fi
+  local bin
+  bin=$(find "${dir}" -type f -name sing-box | head -n1)
+  if [[ -z "${bin}" ]]; then
+    rm -rf "${dir}" "${tmp}"
+    err "压缩包中未找到 sing-box 二进制"
+    return 1
+  fi
+  chmod 755 "${bin}"
+  mv "${bin}" "${SINGBOX_BIN}"
+  chmod 755 "${SINGBOX_BIN}"
+  rm -rf "${dir}" "${tmp}"
+  mkdir -p "${SINGBOX_FRAG_DIR}"
+  chmod 700 "${SINGBOX_DIR}"
+  info "sing-box 安装完成: $(singbox_installed_version || echo unknown)"
+}
+
+install_nginx() {
+  if command -v nginx >/dev/null 2>&1; then
     return 0
   fi
-  chmod 755 "${tmp}"
-  mv "${tmp}" "${HYSTERIA_BIN}"
-  chmod 755 "${HYSTERIA_BIN}"
-  link_binary "${HYSTERIA_BIN}" hysteria
-  mkdir -p "${HYSTERIA_DIR}"
-  chmod 700 "${HYSTERIA_DIR}"
-  info "Hysteria 安装完成: $(hysteria_installed_version || echo unknown)"
+  info "正在安装 Nginx ..."
+  pkg_install nginx || return 1
+  systemctl enable nginx >/dev/null 2>&1 || true
+}
+
+stop_legacy_hysteria() {
+  local unit
+  systemctl list-units --full --all --type=service --no-legend 'hysteria@*' 2>/dev/null \
+    | awk '{print $1}' | while read -r unit; do
+        [[ -n "${unit}" ]] || continue
+        systemctl stop "${unit}" >/dev/null 2>&1 || true
+        systemctl disable "${unit}" >/dev/null 2>&1 || true
+      done
+  rm -f /etc/systemd/system/hysteria@.service
+  if [[ -x /usr/local/bin/hysteria && /usr/local/bin/hysteria != "${SINGBOX_BIN}" ]]; then
+    rm -f /usr/local/bin/hysteria
+  fi
 }
 
 #===============================================================================
@@ -1139,7 +1299,7 @@ install_watchdog_unit() {
   cat > "${WATCHDOG_UNIT}" <<'EOF'
 [Unit]
 Description=xcc watchdog (Xray 自愈 / 日志自维护)
-After=network-online.target xray.service
+After=network-online.target xray.service sing-box.service nginx.service
 Wants=network-online.target
 
 [Service]
@@ -1158,18 +1318,27 @@ EOF
 }
 
 install_hysteria_unit() {
-  cat > "${HYSTERIA_UNIT}" <<'EOF'
+  install_singbox_unit
+}
+
+install_singbox_unit() {
+  cat > "${SINGBOX_UNIT}" <<EOF
 [Unit]
-Description=Hysteria 2 server (%i)
-After=network-online.target
-Wants=network-online.target
+Description=Sing-Box Service
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config-%i.json
-Restart=always
-RestartSec=5
-LimitNOFILE=1048576
+User=root
+WorkingDirectory=${SINGBOX_CONF_DIR}
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+ExecStart=${SINGBOX_BIN} run -c ${SINGBOX_CONF}
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=10
+LimitNPROC=infinity
+LimitNOFILE=infinity
 StandardOutput=null
 StandardError=null
 
@@ -1208,16 +1377,35 @@ ensure_environment() {
   check_network_manager
   check_unattended_upgrades
   install_xray
-  install_hysteria || warn "Hysteria 暂未安装，配置 Hysteria 节点时会重试。"
-  install_hysteria_unit
+  install_nginx || warn "Nginx 暂未安装，配置 TLS / 订阅时会重试。"
+  install_singbox || warn "sing-box 暂未安装，配置 Hysteria2 时会重试。"
+  install_singbox_unit
+  stop_legacy_hysteria
   install_logrotate
   install_watchdog_unit
   : >> "${XCC_LOG}"
   chmod 640 "${XCC_LOG}" 2>/dev/null || true
 }
 
+nginx_front_enabled() {
+  local domain cert key
+  [[ -f "${XCC_NODES}" ]] || return 1
+  domain=$(jq -r '.settings.domain // empty' "${XCC_NODES}" 2>/dev/null)
+  cert=$(jq -r '.settings.cert // empty' "${XCC_NODES}" 2>/dev/null)
+  key=$(jq -r '.settings.key // empty' "${XCC_NODES}" 2>/dev/null)
+  [[ -n "${domain}" && "${domain}" != "localhost" && -n "${cert}" && -f "${cert}" && -n "${key}" && -f "${key}" ]]
+}
+
+nginx_public_port() {
+  jq -r '.settings.nginx_port // 443' "${XCC_NODES}" 2>/dev/null || echo 443
+}
+
+tls_public_host() {
+  jq -r '.settings.domain // empty' "${XCC_NODES}" 2>/dev/null
+}
+
 #===============================================================================
-# 出站解析与 Xray/Hysteria 配置应用
+# 出站解析与 Xray / sing-box / Nginx 配置应用
 #===============================================================================
 outbound_mode() {
   if [[ ! -f "${XCC_OUTBOUND}" ]]; then
@@ -1295,16 +1483,313 @@ xray_reload_or_restart() {
   systemctl restart xray
 }
 
-# Hysteria 语法检查：优先 check；不支持 check 时校验 JSON，避免试启动占用端口。
-hysteria_test_config() {
+# sing-box 语法检查（v2ray-agent 使用 merge + run）。
+singbox_test_config() {
   local cfg="$1"
-  if [[ -x "${HYSTERIA_BIN}" ]]; then
-    if "${HYSTERIA_BIN}" check -config "${cfg}" >/dev/null 2>&1 \
-      || "${HYSTERIA_BIN}" check -c "${cfg}" >/dev/null 2>&1; then
+  if [[ -x "${SINGBOX_BIN}" ]]; then
+    if "${SINGBOX_BIN}" check -c "${cfg}" >/dev/null 2>&1 \
+      || "${SINGBOX_BIN}" check --config "${cfg}" >/dev/null 2>&1; then
       return 0
     fi
   fi
   jq empty "${cfg}" >/dev/null 2>&1
+}
+
+hysteria_test_config() {
+  singbox_test_config "$@"
+}
+
+hy2_cert_files() {
+  local json="$1"
+  local acme domain sni port cert key
+  acme=$(printf '%s' "${json}" | jq -r '.acme')
+  domain=$(printf '%s' "${json}" | jq -r '.domain // empty')
+  sni=$(printf '%s' "${json}" | jq -r '.sni // .domain // "localhost"')
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  cert=$(jq -r '.settings.cert // empty' "${XCC_NODES}")
+  key=$(jq -r '.settings.key // empty' "${XCC_NODES}")
+  if [[ "${acme}" == "true" || ( -n "${domain}" && -f "${cert}" && -f "${key}" ) ]]; then
+    HY2_CERT="${cert:-${XCC_CERT_DIR}/fullchain.pem}"
+    HY2_KEY="${key:-${XCC_CERT_DIR}/privkey.pem}"
+    return 0
+  fi
+  HY2_CERT="${XCC_CERT_DIR}/hy2-${port}.crt"
+  HY2_KEY="${XCC_CERT_DIR}/hy2-${port}.key"
+  if [[ ! -f "${HY2_CERT}" || ! -f "${HY2_KEY}" ]]; then
+    openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+      -keyout "${HY2_KEY}" -out "${HY2_CERT}" -subj "/CN=${sni}" >/dev/null 2>&1
+    chmod 600 "${HY2_KEY}"
+  fi
+}
+
+# 按 v2ray-agent initSingBoxHysteria2Config 生成 sing-box 配置。
+apply_singbox_config() {
+  local hy_count
+  hy_count=$(jq '[.hysteria[]? | select(.enabled==true)] | length' "${XCC_NODES}" 2>/dev/null || echo 0)
+  if [[ "${hy_count}" -eq 0 ]]; then
+    systemctl disable --now sing-box >/dev/null 2>&1 || true
+    return 0
+  fi
+  install_singbox || return 1
+  install_singbox_unit
+  stop_legacy_hysteria
+  mkdir -p "${SINGBOX_FRAG_DIR}"
+  local tmp mode
+  tmp=$(xcc_mktemp .json)
+  mode=$(outbound_mode)
+  local socks_json='null'
+  if [[ "${mode}" == "proxy" ]]; then
+    local url
+    url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
+    parse_socks5 "${url}"
+    socks_json=$(jq -n \
+      --arg host "${SOCKS_HOST}" \
+      --argjson port "${SOCKS_PORT}" \
+      --arg user "${SOCKS_USER}" \
+      --arg pass "${SOCKS_PASS}" \
+      '{
+        type:"socks", tag:"socks5_outbound", server:$host, server_port:$port
+      } + (if $user == "" then {} else {username:$user, password:$pass} end)')
+  fi
+
+  local inbounds='[]' routes='[]' json port password email sni up down obfs tag outbound
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    hy2_cert_files "${json}"
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    password=$(printf '%s' "${json}" | jq -r '.password')
+    email=$(printf '%s' "${json}" | jq -r '.email // .tag // "xcc"')
+    sni=$(printf '%s' "${json}" | jq -r '.sni // .domain // empty')
+    [[ -n "${sni}" ]] || sni=$(tls_public_host)
+    [[ -n "${sni}" ]] || sni="localhost"
+    up=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_UP_MBPS}" '.up_mbps // $d')
+    down=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_DOWN_MBPS}" '.down_mbps // $d')
+    obfs=$(printf '%s' "${json}" | jq -r '.obfs // empty')
+    tag=$(printf '%s' "${json}" | jq -r '.tag')
+    outbound=$(printf '%s' "${json}" | jq -r '.outbound // "proxy"')
+    inbounds=$(jq -c \
+      --argjson acc "${inbounds}" \
+      --argjson port "${port}" \
+      --arg password "${password}" \
+      --arg name "${email}-singbox_hysteria2" \
+      --argjson up "${up}" \
+      --argjson down "${down}" \
+      --arg sni "${sni}" \
+      --arg cert "${HY2_CERT}" \
+      --arg key "${HY2_KEY}" \
+      --arg obfs "${obfs}" \
+      --arg tag "${tag}" \
+      '$acc + [{
+        type:"hysteria2",
+        tag:$tag,
+        listen:"::",
+        listen_port:$port,
+        users:[{password:$password, name:$name}],
+        up_mbps:$up,
+        down_mbps:$down,
+        tls:{enabled:true, server_name:$sni, alpn:["h3"], certificate_path:$cert, key_path:$key}
+      } + (if $obfs == "" then {} else {obfs:{type:"salamander", password:$obfs}} end)]')
+    if [[ "${outbound}" != "direct" && "${mode}" == "proxy" ]]; then
+      routes=$(jq -c --argjson acc "${routes}" --arg tag "${tag}" \
+        '$acc + [{inbound:[$tag], outbound:"socks5_outbound"}]')
+    fi
+    fw_allow_udp "${port}"
+    fw_allow_tcp "${port}"
+  done < <(jq -c '.hysteria[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+
+  if ! jq -n \
+    --argjson inbounds "${inbounds}" \
+    --argjson socks "${socks_json}" \
+    --argjson routes "${routes}" \
+    '{
+      log:{level:"warn", timestamp:true},
+      dns:{servers:[{tag:"local", type:"local"}]},
+      inbounds:$inbounds,
+      outbounds:
+        ([{type:"direct", tag:"direct"}] + (if $socks == null then [] else [$socks] end)),
+      route:{
+        rules:$routes,
+        final:"direct"
+      }
+    }' > "${tmp}"; then
+    err "jq 生成 sing-box 配置失败"
+    rm -f "${tmp}"
+    return 1
+  fi
+  if ! singbox_test_config "${tmp}"; then
+    err "sing-box 配置检查失败"
+    "${SINGBOX_BIN}" check -c "${tmp}" 2>&1 | tail -n 20 >&2 || true
+    rm -f "${tmp}"
+    return 1
+  fi
+  mv "${tmp}" "${SINGBOX_CONF}"
+  chmod 600 "${SINGBOX_CONF}"
+  if [[ "${inbounds}" == "[]" ]]; then
+    systemctl disable --now sing-box >/dev/null 2>&1 || true
+    return 0
+  fi
+  systemctl enable --now sing-box >/dev/null 2>&1 || systemctl restart sing-box
+}
+
+apply_hysteria_config() {
+  apply_singbox_config
+}
+
+nginx_ws_locations() {
+  local json path xport
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
+    xport=$(printf '%s' "${json}" | jq -r --argjson d "${XRAY_VLESS_WS_LOCAL}" '.xray_port // $d')
+    cat <<EOF
+    location ${path} {
+        if (\$http_upgrade != "websocket") { return 444; }
+        proxy_pass http://127.0.0.1:${xport};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header Host \$host;
+        proxy_redirect off;
+    }
+EOF
+  done < <(jq -c '.vless_ws[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
+    xport=$(printf '%s' "${json}" | jq -r --argjson d "${XRAY_VMESS_WS_LOCAL}" '.xray_port // $d')
+    cat <<EOF
+    location ${path} {
+        if (\$http_upgrade != "websocket") { return 444; }
+        proxy_pass http://127.0.0.1:${xport};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header Host \$host;
+        proxy_redirect off;
+    }
+EOF
+  done < <(jq -c '.vmess[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+}
+
+apply_nginx_config() {
+  install_nginx || return 1
+  mkdir -p "${NGINX_WWW}/.well-known/acme-challenge" "${XCC_SUB_DIR}"
+  rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+  local domain cert key nport sport tmp locs
+  domain=$(tls_public_host)
+  cert=$(jq -r '.settings.cert // empty' "${XCC_NODES}")
+  key=$(jq -r '.settings.key // empty' "${XCC_NODES}")
+  nport=$(nginx_public_port)
+  sport=$(jq -r '.settings.sub_port // 2096' "${XCC_NODES}")
+  tmp=$(xcc_mktemp)
+  locs=$(nginx_ws_locations)
+  {
+    cat <<EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name ${domain:-_};
+    root ${NGINX_WWW};
+    location /.well-known/acme-challenge/ {
+        root ${NGINX_WWW};
+    }
+EOF
+    if nginx_front_enabled; then
+      cat <<'EOF'
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+EOF
+    else
+      cat <<'EOF'
+    location / {
+        return 200 'xcc';
+        add_header Content-Type text/plain;
+    }
+}
+EOF
+    fi
+    if nginx_front_enabled; then
+      fw_allow_tcp "${nport}" >/dev/null
+      cat <<EOF
+server {
+    listen ${nport} ssl http2;
+    listen [::]:${nport} ssl http2;
+    server_name ${domain};
+    root ${NGINX_WWW};
+    ssl_certificate ${cert};
+    ssl_certificate_key ${key};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers TLS13_AES_128_GCM_SHA256:TLS13_AES_256_GCM_SHA384:TLS13_CHACHA20_POLY1305_SHA256:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers on;
+    client_max_body_size 100m;
+${locs}
+    location /s/ {
+        alias ${XCC_SUB_DIR}/;
+        types { }
+        default_type text/plain;
+        add_header Cache-Control "no-store";
+    }
+    location / {
+        proxy_pass https://www.python.org;
+        proxy_ssl_server_name on;
+        proxy_set_header Host www.python.org;
+        proxy_set_header Accept-Encoding "";
+    }
+}
+EOF
+    else
+      fw_allow_tcp "${sport}" >/dev/null
+      cat <<EOF
+server {
+    listen ${sport};
+    listen [::]:${sport};
+    server_name _;
+    location / {
+        alias ${XCC_SUB_DIR}/;
+        types { }
+        default_type text/plain;
+        add_header Cache-Control "no-store";
+    }
+}
+EOF
+    fi
+  } > "${tmp}"
+  local bak=""
+  if [[ -f "${NGINX_CONF}" ]]; then
+    bak=$(xcc_mktemp)
+    cp -a "${NGINX_CONF}" "${bak}"
+  fi
+  cp "${tmp}" "${NGINX_CONF}"
+  rm -f "${tmp}"
+  if nginx -t >/dev/null 2>&1; then
+    systemctl enable nginx >/dev/null 2>&1 || true
+    systemctl reload nginx >/dev/null 2>&1 || systemctl restart nginx
+    [[ -n "${bak}" ]] && rm -f "${bak}"
+  else
+    err "Nginx 配置检查失败"
+    nginx -t 2>&1 | tail -n 20 >&2 || true
+    if [[ -n "${bak}" ]]; then
+      mv "${bak}" "${NGINX_CONF}"
+    else
+      rm -f "${NGINX_CONF}"
+    fi
+    return 1
+  fi
+  systemctl disable --now xcc-sub >/dev/null 2>&1 || true
+}
+
+apply_all_configs() {
+  apply_xray_config || return 1
+  apply_singbox_config || return 1
+  write_subscribe_files || true
+  apply_nginx_config || return 1
+  return 0
 }
 
 # 根据 nodes.json + outbound.conf 重建 Xray 配置。
@@ -1352,6 +1837,8 @@ apply_xray_config() {
 
   node_json=$(cat "${XCC_NODES}")
   tmp=$(xcc_mktemp .json)
+  local nginx_front="false"
+  nginx_front_enabled && nginx_front="true"
 
   if ! jq -n \
     --argjson dns "${dns_json}" \
@@ -1359,6 +1846,9 @@ apply_xray_config() {
     --argjson proxy "${proxy_json}" \
     --argjson warp "${warp_json}" \
     --argjson has_geo "${has_geo}" \
+    --argjson nginx_front "${nginx_front}" \
+    --argjson vless_local "${XRAY_VLESS_WS_LOCAL}" \
+    --argjson vmess_local "${XRAY_VMESS_WS_LOCAL}" \
     --arg default_tag "$( [[ "${mode}" == "proxy" ]] && echo proxy || echo direct )" \
     --arg reality_sid "${REALITY_DEFAULT_SID}" \
     --argjson max_time_diff "${REALITY_MAX_TIME_DIFF}" \
@@ -1420,19 +1910,47 @@ apply_xray_config() {
         sniffing: sniff
       };
     def vless_ws_inbound:
-      {
-        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vless",
-        settings: {clients: [{id: .uuid, email: (.email // .tag // "xcc")}], decryption: "none"},
-        streamSettings: tls_ss("ws"),
-        sniffing: sniff
-      };
+      (
+        if $nginx_front then
+          {
+            tag: .tag, listen: "127.0.0.1", port: (.xray_port // $vless_local), protocol: "vless",
+            settings: {clients: [{id: .uuid, email: (.email // .tag // "xcc")}], decryption: "none"},
+            streamSettings: {
+              network: "ws", security: "none",
+              wsSettings: {path: (.path // "/xcc"), headers: {Host: (.host // .sni // "")}}
+            },
+            sniffing: sniff
+          }
+        else
+          {
+            tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vless",
+            settings: {clients: [{id: .uuid, email: (.email // .tag // "xcc")}], decryption: "none"},
+            streamSettings: tls_ss("ws"),
+            sniffing: sniff
+          }
+        end
+      );
     def vmess_inbound:
-      {
-        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vmess",
-        settings: {clients: [{id: .uuid, alterId: 0, email: (.email // .tag // "xcc")}]},
-        streamSettings: tls_ss(.network // "ws"),
-        sniffing: sniff
-      };
+      (
+        if $nginx_front then
+          {
+            tag: .tag, listen: "127.0.0.1", port: (.xray_port // $vmess_local), protocol: "vmess",
+            settings: {clients: [{id: .uuid, alterId: 0, email: (.email // .tag // "xcc")}]},
+            streamSettings: {
+              network: "ws", security: "none",
+              wsSettings: {path: (.path // "/xcc"), headers: {Host: (.host // .sni // "")}}
+            },
+            sniffing: sniff
+          }
+        else
+          {
+            tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vmess",
+            settings: {clients: [{id: .uuid, alterId: 0, email: (.email // .tag // "xcc")}]},
+            streamSettings: tls_ss(.network // "ws"),
+            sniffing: sniff
+          }
+        end
+      );
     def trojan_inbound:
       {
         tag: .tag, listen: "0.0.0.0", port: .port, protocol: "trojan",
@@ -1520,134 +2038,7 @@ apply_xray_config() {
   mv "${tmp}" "${XRAY_CONF}"
   chmod 600 "${XRAY_CONF}"
   xray_reload_or_restart
-}
-
-hysteria_outbound_json() {
-  local node_ob="$1"
-  local mode
-  mode=$(outbound_mode)
-  if [[ "${node_ob}" == "direct" || "${mode}" != "proxy" ]]; then
-    printf '%s' '[]'
-    return
-  fi
-  local url
-  url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
-  parse_socks5 "${url}"
-  jq -n \
-    --arg addr "${SOCKS_HOST}:${SOCKS_PORT}" \
-    --arg user "${SOCKS_USER}" \
-    --arg pass "${SOCKS_PASS}" \
-    '[{name:"proxy", type:"socks5", socks5:(
-        {addr:$addr} + (if $user == "" then {} else {username:$user, password:$pass} end)
-      )}]'
-}
-
-write_hysteria_node_config() {
-  local tag="$1"
-  local tmp cfg ob json
-  json=$(jq -c --arg tag "${tag}" '.hysteria[] | select(.tag==$tag)' "${XCC_NODES}")
-  [[ -n "${json}" ]] || return 1
-  local port password obfs acme domain email sni outbound up_mbps down_mbps
-  port=$(printf '%s' "${json}" | jq -r '.port')
-  password=$(printf '%s' "${json}" | jq -r '.password')
-  obfs=$(printf '%s' "${json}" | jq -r '.obfs // empty')
-  acme=$(printf '%s' "${json}" | jq -r '.acme')
-  domain=$(printf '%s' "${json}" | jq -r '.domain // empty')
-  email=$(printf '%s' "${json}" | jq -r '.email // "admin@localhost"')
-  sni=$(printf '%s' "${json}" | jq -r '.sni // .domain // "localhost"')
-  outbound=$(printf '%s' "${json}" | jq -r '.outbound // "proxy"')
-  up_mbps=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_UP_MBPS}" '.up_mbps // $d')
-  down_mbps=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_DOWN_MBPS}" '.down_mbps // $d')
-  cfg="${HYSTERIA_DIR}/config-${port}.json"
-  tmp=$(xcc_mktemp .json)
-  ob=$(hysteria_outbound_json "${outbound}")
-
-  if [[ "${acme}" == "true" ]]; then
-    jq -n \
-      --argjson port "${port}" \
-      --arg password "${password}" \
-      --arg obfs "${obfs}" \
-      --arg domain "${domain}" \
-      --arg email "${email}" \
-      --argjson outbounds "${ob}" \
-      --argjson up "${up_mbps}" \
-      --argjson down "${down_mbps}" \
-      --arg masq "https://www.microsoft.com" \
-      '
-      {
-        listen: (":" + ($port|tostring)),
-        auth: {type:"password", password:$password},
-        tls: {acme:{domains:[$domain], email:$email}},
-        bandwidth: {up: (($up|tostring) + " mbps"), down: (($down|tostring) + " mbps")},
-        masquerade: {type:"proxy", proxy:{url:$masq, rewriteHost:true}}
-      }
-      + (if $obfs == "" then {} else {obfs:{type:"salamander", salamander:{password:$obfs}}} end)
-      + (if ($outbounds|length) == 0 then {} else {outbounds:$outbounds} end)
-      ' > "${tmp}"
-  else
-    local cert="${HYSTERIA_DIR}/server-${port}.crt"
-    local key="${HYSTERIA_DIR}/server-${port}.key"
-    if [[ ! -f "${cert}" || ! -f "${key}" ]]; then
-      openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
-        -keyout "${key}" -out "${cert}" -subj "/CN=${sni}" >/dev/null 2>&1
-      chmod 600 "${key}"
-    fi
-    jq -n \
-      --argjson port "${port}" \
-      --arg password "${password}" \
-      --arg obfs "${obfs}" \
-      --arg cert "${cert}" \
-      --arg key "${key}" \
-      --argjson outbounds "${ob}" \
-      --argjson up "${up_mbps}" \
-      --argjson down "${down_mbps}" \
-      --arg masq "https://www.microsoft.com" \
-      '
-      {
-        listen: (":" + ($port|tostring)),
-        auth: {type:"password", password:$password},
-        tls: {cert:$cert, key:$key},
-        bandwidth: {up: (($up|tostring) + " mbps"), down: (($down|tostring) + " mbps")},
-        masquerade: {type:"proxy", proxy:{url:$masq, rewriteHost:true}}
-      }
-      + (if $obfs == "" then {} else {obfs:{type:"salamander", salamander:{password:$obfs}}} end)
-      + (if ($outbounds|length) == 0 then {} else {outbounds:$outbounds} end)
-      ' > "${tmp}"
-  fi
-
-  if ! hysteria_test_config "${tmp}"; then
-    err "Hysteria 配置语法检查失败: ${cfg}"
-    rm -f "${tmp}"
-    return 1
-  fi
-  mv "${tmp}" "${cfg}"
-  chmod 600 "${cfg}"
-  # 兼容用户指定的默认路径
-  cp -a "${cfg}" "${HYSTERIA_CONF}"
-  chmod 600 "${HYSTERIA_CONF}"
-}
-
-apply_hysteria_config() {
-  local p enabled tag
-  install_hysteria_unit
-  while IFS= read -r p; do
-    [[ -n "${p}" ]] || continue
-    enabled=$(jq -r --argjson port "${p}" '.hysteria[] | select(.port==$port) | .enabled' "${XCC_NODES}")
-    if [[ "${enabled}" == "true" ]]; then
-      tag=$(jq -r --argjson port "${p}" '.hysteria[] | select(.port==$port) | .tag' "${XCC_NODES}")
-      write_hysteria_node_config "${tag}" || return 1
-      systemctl enable --now "hysteria@${p}" >/dev/null 2>&1 || systemctl restart "hysteria@${p}"
-    else
-      systemctl stop "hysteria@${p}" >/dev/null 2>&1 || true
-      systemctl disable "hysteria@${p}" >/dev/null 2>&1 || true
-    fi
-  done < <(jq -r '.hysteria[]?.port' "${XCC_NODES}" 2>/dev/null)
-}
-
-apply_all_configs() {
-  apply_xray_config || return 1
-  apply_hysteria_config || return 1
-  return 0
+  write_subscribe_files || true
 }
 
 #===============================================================================
@@ -1788,21 +2179,32 @@ vless_ws_share_link() {
   local json="$1" ip uuid port sni host path email
   ip=$(public_ip)
   uuid=$(printf '%s' "${json}" | jq -r '.uuid')
-  port=$(printf '%s' "${json}" | jq -r '.port')
   sni=$(printf '%s' "${json}" | jq -r '.sni // .host // empty')
   host=$(printf '%s' "${json}" | jq -r '.host // .sni // empty')
   path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
   email=$(node_email "${json}")
+  if nginx_front_enabled; then
+    port=$(nginx_public_port)
+    host=$(tls_public_host)
+    sni="${host}"
+  else
+    port=$(printf '%s' "${json}" | jq -r '.port')
+  fi
   printf 'vless://%s@%s:%s?encryption=none&security=tls&type=ws&host=%s&sni=%s&fp=chrome&path=%s#%s\n' \
     "${uuid}" "${ip}" "${port}" "${host}" "${sni}" "${path}" "${email}"
 }
 
 vmess_share_link() {
-  local json="$1" ip payload email
+  local json="$1" ip payload email port
   ip=$(public_ip)
   email=$(node_email "${json}")
-  payload=$(printf '%s' "${json}" | jq -c --arg ip "${ip}" --arg ps "${email}" '{
-      v:2, ps:$ps, add:$ip, port:(.port|tonumber),
+  if nginx_front_enabled; then
+    port=$(nginx_public_port)
+  else
+    port=$(printf '%s' "${json}" | jq -r '.port')
+  fi
+  payload=$(printf '%s' "${json}" | jq -c --arg ip "${ip}" --arg ps "${email}" --argjson port "${port}" '{
+      v:2, ps:$ps, add:$ip, port:$port,
       id:.uuid, aid:0, tls:"tls", host:(.host // .sni // ""),
       type:"none", path:(.path // "/xcc"), net:(.network // "ws"),
       method:"none", peer:(.sni // .host // ""), sni:(.sni // .host // "")
@@ -1885,7 +2287,7 @@ yaml_quote() {
 write_clash_proxies() {
   local file="$1"
   local names_file="$2"
-  local json ip email host port insecure up down
+  local json ip email host port insecure up down obfs
   : > "${file}"
   : > "${names_file}"
   ip=$(public_ip)
@@ -1916,8 +2318,13 @@ write_clash_proxies() {
   while IFS= read -r json; do
     [[ -n "${json}" ]] || continue
     email=$(node_email "${json}")
-    port=$(printf '%s' "${json}" | jq -r '.port')
-    host=$(printf '%s' "${json}" | jq -r '.host // .sni // empty')
+    if nginx_front_enabled; then
+      port=$(nginx_public_port)
+      host=$(tls_public_host)
+    else
+      port=$(printf '%s' "${json}" | jq -r '.port')
+      host=$(printf '%s' "${json}" | jq -r '.host // .sni // empty')
+    fi
     printf '%s\n' "${email}" >> "${names_file}"
     {
       echo "  - name: $(yaml_quote "${email}")"
@@ -1929,7 +2336,7 @@ write_clash_proxies() {
       echo "    tls: true"
       echo "    network: ws"
       echo "    client-fingerprint: chrome"
-      echo "    servername: $(printf '%s' "${json}" | jq -r '.sni // .host')"
+      echo "    servername: ${host}"
       echo "    ws-opts:"
       echo "      path: $(printf '%s' "${json}" | jq -r '.path // "/xcc"')"
       echo "      headers:"
@@ -1940,8 +2347,13 @@ write_clash_proxies() {
   while IFS= read -r json; do
     [[ -n "${json}" ]] || continue
     email=$(node_email "${json}")
-    port=$(printf '%s' "${json}" | jq -r '.port')
-    host=$(printf '%s' "${json}" | jq -r '.host // .sni // empty')
+    if nginx_front_enabled; then
+      port=$(nginx_public_port)
+      host=$(tls_public_host)
+    else
+      port=$(printf '%s' "${json}" | jq -r '.port')
+      host=$(printf '%s' "${json}" | jq -r '.host // .sni // empty')
+    fi
     printf '%s\n' "${email}" >> "${names_file}"
     {
       echo "  - name: $(yaml_quote "${email}")"
@@ -1954,7 +2366,7 @@ write_clash_proxies() {
       echo "    udp: true"
       echo "    tls: true"
       echo "    client-fingerprint: chrome"
-      echo "    servername: $(printf '%s' "${json}" | jq -r '.sni // .host')"
+      echo "    servername: ${host}"
       echo "    network: ws"
       echo "    ws-opts:"
       echo "      path: $(printf '%s' "${json}" | jq -r '.path // "/xcc"')"
@@ -1992,6 +2404,7 @@ write_clash_proxies() {
     insecure=$(printf '%s' "${json}" | jq -r '.insecure // true')
     up=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_DOWN_MBPS}" '.down_mbps // $d')
     down=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_UP_MBPS}" '.up_mbps // $d')
+    obfs=$(printf '%s' "${json}" | jq -r '.obfs // empty')
     [[ -n "${host}" && "${host}" != "localhost" ]] || host="${ip}"
     printf '%s\n' "${email}" >> "${names_file}"
     {
@@ -2005,6 +2418,10 @@ write_clash_proxies() {
       echo "    sni: ${host}"
       echo "    up: \"${up} Mbps\""
       echo "    down: \"${down} Mbps\""
+      if [[ -n "${obfs}" ]]; then
+        echo "    obfs: salamander"
+        echo "    obfs-password: ${obfs}"
+      fi
       if [[ "${insecure}" == "true" ]]; then
         echo "    skip-cert-verify: true"
       fi
@@ -2066,44 +2483,39 @@ EOF
   rm -f "${proxies}" "${names_file}"
 }
 
-rebuild_subscribe() {
-  local tok port ip raw clash
+write_subscribe_files() {
+  local tok raw clash
+  [[ -f "${XCC_NODES}" ]] || return 0
   migrate_nodes_json
   mkdir -p "${XCC_SUB_DIR}"
   chmod 755 "${XCC_SUB_DIR}"
   tok=$(ensure_sub_token)
-  port=$(jq -r '.settings.sub_port // 2096' "${XCC_NODES}")
-  ip=$(public_ip)
   raw="${XCC_SUB_DIR}/raw.txt"
   clash="${XCC_SUB_DIR}/${tok}.clash.yaml"
   collect_all_links > "${raw}"
   (base64 -w0 "${raw}" 2>/dev/null || base64 "${raw}") > "${XCC_SUB_DIR}/${tok}"
   write_clash_subscribe "${clash}"
   chmod 644 "${XCC_SUB_DIR}/${tok}" "${raw}" "${clash}"
-  local py
-  py=$(command -v python3 || echo /usr/bin/python3)
-  cat > /etc/systemd/system/xcc-sub.service <<EOF
-[Unit]
-Description=xcc subscription HTTP
-After=network.target
+}
 
-[Service]
-Type=simple
-WorkingDirectory=${XCC_SUB_DIR}
-ExecStart=${py} -m http.server ${port} --bind 0.0.0.0
-Restart=always
-RestartSec=3
-StandardOutput=null
-StandardError=null
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  systemctl daemon-reload
-  fw_allow_tcp "${port}" >/dev/null
-  systemctl enable --now xcc-sub >/dev/null 2>&1 || systemctl restart xcc-sub
-  printf '通用订阅: http://%s:%s/%s\nClash Meta: http://%s:%s/%s.clash.yaml\n' \
-    "${ip}" "${port}" "${tok}" "${ip}" "${port}" "${tok}"
+rebuild_subscribe() {
+  local tok port ip domain nport
+  write_subscribe_files
+  tok=$(ensure_sub_token)
+  port=$(jq -r '.settings.sub_port // 2096' "${XCC_NODES}")
+  nport=$(nginx_public_port)
+  ip=$(public_ip)
+  domain=$(tls_public_host)
+  apply_nginx_config || true
+  systemctl disable --now xcc-sub >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/xcc-sub.service
+  if nginx_front_enabled && [[ -n "${domain}" ]]; then
+    printf '通用订阅: https://%s:%s/s/%s\nClash Meta: https://%s:%s/s/%s.clash.yaml\n' \
+      "${domain}" "${nport}" "${tok}" "${domain}" "${nport}" "${tok}"
+  else
+    printf '通用订阅: http://%s:%s/%s\nClash Meta: http://%s:%s/%s.clash.yaml\n' \
+      "${ip}" "${port}" "${tok}" "${ip}" "${port}" "${tok}"
+  fi
 }
 
 bytes_human() {
@@ -2129,14 +2541,11 @@ menu_dashboard() {
   cores=$(nproc)
   xst=$(systemctl is-active xray 2>/dev/null || echo unknown)
   wst=$(systemctl is-active xcc-watchdog 2>/dev/null || echo unknown)
-  hst="inactive"
-  local hp
-  hp=$(jq -r '.hysteria[]? | select(.enabled==true) | .port' "${XCC_NODES}" 2>/dev/null | head -n1)
-  if [[ -n "${hp}" ]]; then
-    hst=$(systemctl is-active "hysteria@${hp}" 2>/dev/null || echo inactive)
-  fi
+  hst=$(systemctl is-active sing-box 2>/dev/null || echo inactive)
+  local nst
+  nst=$(systemctl is-active nginx 2>/dev/null || echo inactive)
   ver_x=$(xray_installed_version || echo -)
-  ver_h=$(hysteria_installed_version || echo -)
+  ver_h=$(singbox_installed_version || echo -)
   ip=$(public_ip)
   {
     echo "===== xcc ${XCC_VERSION} 状态面板 ====="
@@ -2148,7 +2557,8 @@ menu_dashboard() {
     echo "运行时间: ${up}"
     echo
     echo "Xray: ${xst}  ${ver_x}"
-    echo "Hysteria: ${hst}  ${ver_h}"
+    echo "sing-box (Hysteria2): ${hst}  ${ver_h}"
+    echo "Nginx: ${nst}"
     echo "看门狗: ${wst}"
     echo
     echo "----- 节点 -----"
@@ -2202,10 +2612,14 @@ issue_acme_cert() {
   local domain="$1" email="${2:-admin@${1}}"
   [[ -n "${domain}" ]] || return 1
   fw_allow_tcp 80
+  install_nginx || true
+  mkdir -p "${NGINX_WWW}/.well-known/acme-challenge"
+  apply_nginx_config || true
   install_acme_sh || return 1
   "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
   "${HOME}/.acme.sh/acme.sh" --register-account -m "${email}" >/dev/null 2>&1 || true
-  if ! "${HOME}/.acme.sh/acme.sh" --issue -d "${domain}" --standalone --httpport 80 --force; then
+  if ! "${HOME}/.acme.sh/acme.sh" --issue -d "${domain}" -w "${NGINX_WWW}" --force \
+    && ! "${HOME}/.acme.sh/acme.sh" --issue -d "${domain}" --standalone --httpport 80 --force; then
     tui_msg "错误" "ACME 签发失败。请确认域名已解析到本机，且 80 端口未被占用。"
     return 1
   fi
@@ -2213,7 +2627,7 @@ issue_acme_cert() {
   "${HOME}/.acme.sh/acme.sh" --install-cert -d "${domain}" \
     --key-file "${XCC_CERT_DIR}/privkey.pem" \
     --fullchain-file "${XCC_CERT_DIR}/fullchain.pem" \
-    --reloadcmd "systemctl reload xray || systemctl restart xray"
+    --reloadcmd "systemctl reload nginx; systemctl reload xray || systemctl restart xray; systemctl restart sing-box"
   chmod 600 "${XCC_CERT_DIR}/privkey.pem"
   set_settings_field cert "${XCC_CERT_DIR}/fullchain.pem"
   set_settings_field key "${XCC_CERT_DIR}/privkey.pem"
@@ -2251,7 +2665,7 @@ menu_certs() {
       domain=$(tui_input "ACME" "域名" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || { end_config_op_cancel; return 1; }
       email=$(tui_input "ACME" "邮箱" "admin@${domain}") || { end_config_op_cancel; return 1; }
       if issue_acme_cert "${domain}" "${email}"; then
-        apply_xray_config || true
+        apply_all_configs || true
         end_config_op_ok
         tui_msg "完成" "证书已安装到 ${XCC_CERT_DIR}"
       else
@@ -2260,7 +2674,10 @@ menu_certs() {
       ;;
     self)
       domain=$(tui_input "自签名" "CN / 域名" "localhost") || return 1
+      begin_config_op
       make_self_signed "${domain}"
+      apply_all_configs || true
+      end_config_op_ok
       tui_msg "完成" "自签名证书已生成。"
       ;;
     show)
@@ -2376,10 +2793,10 @@ menu_routing() {
 
 menu_subscribe() {
   local url choice generic
-  choice=$(tui_menu "订阅与分享" "生成全部节点分享链接 / 通用订阅（base64）" \
-    "build" "生成并启动订阅服务" \
+  choice=$(tui_menu "订阅与分享" "生成全部节点分享链接 / 通用订阅（Nginx 提供）" \
+    "build" "生成订阅（Nginx /s/TOKEN）" \
     "show" "显示全部分享链接" \
-    "stop" "停止订阅 HTTP 服务") || return 0
+    "stop" "说明：订阅由 Nginx 提供") || return 0
   case "${choice}" in
     build)
       url=$(rebuild_subscribe)
@@ -2392,21 +2809,22 @@ menu_subscribe() {
       tui_textbox_file "分享链接" "${XCC_TMP_DIR}/links.txt"
       ;;
     stop)
-      systemctl disable --now xcc-sub >/dev/null 2>&1 || true
-      tui_msg "完成" "订阅服务已停止。"
+      tui_msg "完成" "订阅由 Nginx 提供。停用请删除 TLS 节点或卸载 xcc。"
       ;;
   esac
 }
 
 menu_core_update() {
   local choice
-  choice=$(tui_menu "更新核心" "Xray / Hysteria / xcc 脚本" \
+  choice=$(tui_menu "更新核心" "Xray / sing-box / Nginx / xcc 脚本" \
     "xray" "更新 Xray 到最新 TLS 版本" \
-    "hy" "更新 Hysteria" \
+    "sb" "更新 sing-box（Hysteria2）" \
+    "nginx" "安装 / 检查 Nginx" \
     "xcc" "更新 xcc 脚本") || return 0
   case "${choice}" in
     xray) install_xray; tui_msg "完成" "Xray: $(xray_installed_version)" ;;
-    hy) install_hysteria; tui_msg "完成" "Hysteria: $(hysteria_installed_version)" ;;
+    sb) install_singbox; tui_msg "完成" "sing-box: $(singbox_installed_version)" ;;
+    nginx) install_nginx; apply_nginx_config; tui_msg "完成" "Nginx: $(nginx -v 2>&1)" ;;
     xcc) cmd_update ;;
   esac
 }
@@ -2449,26 +2867,27 @@ save_tls_node() {
   upsert_node "${kind}" "${node}"
   fw_allow_tcp "${port}"
   [[ "${udp}" == "1" ]] && fw_allow_udp "${port}"
-  apply_xray_config
+  apply_all_configs
 }
 
 menu_config_vless_ws() {
   local port domain path uuid tag node
   begin_config_op
-  port=$(tui_input "VLESS-WS-TLS" "端口" "443") || { end_config_op_cancel; return 1; }
-  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  port=$(tui_input "VLESS-WS-TLS" "公网端口（Nginx TLS，Xray 走 127.0.0.1:31297）" "443") || { end_config_op_cancel; return 1; }
+  assert_nginx_listen_port "${port}" || { end_config_op_cancel; return 1; }
   domain=$(tui_input "VLESS-WS-TLS" "域名 / SNI" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || { end_config_op_cancel; return 1; }
   path=$(tui_input "VLESS-WS-TLS" "WebSocket 路径" "/xcc") || { end_config_op_cancel; return 1; }
   prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  jq_apply "${XCC_NODES}" --argjson p "${port}" '.settings.nginx_port = $p' || { end_config_op_fail; return 1; }
   uuid=$(xray_uuid)
   tag="vlessws-${port}"
-  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg uuid "${uuid}" \
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --argjson xray_port "${XRAY_VLESS_WS_LOCAL}" --arg uuid "${uuid}" \
     --arg sni "${domain}" --arg host "${domain}" --arg path "${path}" \
     --arg cert "${CERT_FILE}" --arg key "${KEY_FILE}" \
-    '{tag:$tag,enabled:true,port:$port,uuid:$uuid,sni:$sni,host:$host,path:$path,cert:$cert,key:$key,email:$tag,outbound:"proxy"}')
+    '{tag:$tag,enabled:true,port:$port,xray_port:$xray_port,uuid:$uuid,sni:$sni,host:$host,path:$path,cert:$cert,key:$key,email:$tag,outbound:"proxy"}')
   if save_tls_node vless_ws "${node}" "${port}"; then
     end_config_op_ok
-    show_share_and_qr "VLESS-WS-TLS 已创建" "$(vless_ws_share_link "${node}")"
+    show_share_and_qr "VLESS-WS-TLS 已创建（Nginx 反代）" "$(vless_ws_share_link "${node}")"
   else
     end_config_op_fail
   fi
@@ -2477,17 +2896,18 @@ menu_config_vless_ws() {
 menu_config_vmess() {
   local port domain path uuid tag node
   begin_config_op
-  port=$(tui_input "VMess-WS-TLS" "端口" "443") || { end_config_op_cancel; return 1; }
-  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  port=$(tui_input "VMess-WS-TLS" "公网端口（Nginx TLS，Xray 走 127.0.0.1:31299）" "443") || { end_config_op_cancel; return 1; }
+  assert_nginx_listen_port "${port}" || { end_config_op_cancel; return 1; }
   domain=$(tui_input "VMess-WS-TLS" "域名 / SNI" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || { end_config_op_cancel; return 1; }
   path=$(tui_input "VMess-WS-TLS" "WebSocket 路径" "/vmess") || { end_config_op_cancel; return 1; }
   prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  jq_apply "${XCC_NODES}" --argjson p "${port}" '.settings.nginx_port = $p' || { end_config_op_fail; return 1; }
   uuid=$(xray_uuid)
   tag="vmess-${port}"
-  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg uuid "${uuid}" \
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --argjson xray_port "${XRAY_VMESS_WS_LOCAL}" --arg uuid "${uuid}" \
     --arg sni "${domain}" --arg host "${domain}" --arg path "${path}" \
     --arg cert "${CERT_FILE}" --arg key "${KEY_FILE}" \
-    '{tag:$tag,enabled:true,port:$port,uuid:$uuid,sni:$sni,host:$host,path:$path,network:"ws",cert:$cert,key:$key,email:$tag,outbound:"proxy"}')
+    '{tag:$tag,enabled:true,port:$port,xray_port:$xray_port,uuid:$uuid,sni:$sni,host:$host,path:$path,network:"ws",cert:$cert,key:$key,email:$tag,outbound:"proxy"}')
   if save_tls_node vmess "${node}" "${port}"; then
     end_config_op_ok
     show_share_and_qr "VMess-WS-TLS 已创建" "$(vmess_share_link "${node}")"
@@ -2556,13 +2976,13 @@ menu_manage_generic() {
         else
           set_node_field "${kind}" "${tag}" enabled true 1
         fi
-        if apply_xray_config; then end_config_op_ok; else end_config_op_fail; fi
+        if apply_all_configs; then end_config_op_ok; else end_config_op_fail; fi
         ;;
       out)
         begin_config_op
         ob=$(tui_menu "出站" "为 ${tag} 选择" "proxy" "Shifter/SOCKS5" "direct" "直连" "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
         set_node_field "${kind}" "${tag}" outbound "${ob}"
-        if apply_xray_config; then end_config_op_ok; else end_config_op_fail; fi
+        if apply_all_configs; then end_config_op_ok; else end_config_op_fail; fi
         ;;
       share)
         show_share_and_qr "${kind}" "$(node_share_link "${kind}" "${json}")"
@@ -2571,7 +2991,7 @@ menu_manage_generic() {
         begin_config_op
         if tui_yesno "删除" "确认删除 ${tag}？"; then
           delete_node "${kind}" "${tag}"
-          if apply_xray_config; then end_config_op_ok; return 0; else end_config_op_fail; fi
+          if apply_all_configs; then end_config_op_ok; return 0; else end_config_op_fail; fi
         else
           end_config_op_cancel
         fi
@@ -2681,37 +3101,44 @@ menu_config_reality() {
 }
 
 #===============================================================================
-# 菜单：配置 Hysteria
+# 菜单：配置 Hysteria2（sing-box，与 v2ray-agent 相同 inbound）
 #===============================================================================
 menu_config_hysteria() {
-  local port password obfs domain email sni tag use_acme
+  local port password obfs domain email sni tag use_acme cert key
   begin_config_op
-  install_hysteria || { tui_msg "错误" "Hysteria 安装失败"; end_config_op_fail; return 1; }
-  port=$(tui_input "配置 Hysteria 节点" "请输入端口" "8443") || { end_config_op_cancel; return 1; }
-  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
-  password=$(tui_input "配置 Hysteria 节点" "请输入密码（回车则使用 UUID，与 v2ray-agent 一致）" "$(xray_uuid)") || { end_config_op_cancel; return 1; }
+  install_singbox || { tui_msg "错误" "sing-box 安装失败"; end_config_op_fail; return 1; }
+  port=$(tui_input "配置 Hysteria2" "UDP 端口（可与 Nginx TCP 443 并存，与 v2ray-agent 相同）" "443") || { end_config_op_cancel; return 1; }
+  assert_udp_port_free "${port}" || { end_config_op_cancel; return 1; }
+  password=$(tui_input "配置 Hysteria2" "请输入密码（回车则使用 UUID，与 v2ray-agent 一致）" "$(xray_uuid)") || { end_config_op_cancel; return 1; }
   if tui_yesno "salamander 混淆" "是否启用 salamander 混淆？（v2ray-agent 默认关闭）" 1; then
     obfs=$(tui_input "混淆参数" "salamander 密码（回车随机）" "$(rand_alnum 16)") || { end_config_op_cancel; return 1; }
   else
     obfs=""
   fi
-  domain=""
+  domain=$(jq -r '.settings.domain // empty' "${XCC_NODES}")
+  cert=$(jq -r '.settings.cert // empty' "${XCC_NODES}")
+  key=$(jq -r '.settings.key // empty' "${XCC_NODES}")
   email=""
-  sni="localhost"
-  if tui_yesno "ACME 证书" "是否启用 ACME（需要已解析到本机的域名）？"; then
+  use_acme="false"
+  if [[ -n "${domain}" && "${domain}" != "localhost" && -n "${cert}" && -f "${cert}" && -n "${key}" && -f "${key}" ]]; then
+    sni="${domain}"
+    tui_msg "TLS 证书" "将使用已有证书 ${cert}（域名 ${domain}）。"
+  elif tui_yesno "ACME 证书" "是否启用 ACME（需要已解析到本机的域名）？"; then
     use_acme="true"
-    domain=$(tui_input "ACME 域名" "请输入域名" "") || { end_config_op_cancel; return 1; }
+    domain=$(tui_input "ACME 域名" "请输入域名" "${domain}") || { end_config_op_cancel; return 1; }
     email=$(tui_input "ACME 邮箱" "请输入邮箱" "admin@${domain}") || { end_config_op_cancel; return 1; }
     sni="${domain}"
+    issue_acme_cert "${domain}" "${email}" || { end_config_op_fail; return 1; }
   else
-    use_acme="false"
     tui_msg "自签名证书" "未启用 ACME，将生成自签名证书（客户端需 insecure，仅限测试）。"
+    sni="localhost"
+    domain=""
   fi
   tag="hysteria-${port}"
   [[ -n "${email}" ]] || email="${tag}"
-  local node tmp insecure
+  local node insecure
   insecure="true"
-  [[ "${use_acme}" == "true" ]] && insecure="false"
+  [[ -n "${sni}" && "${sni}" != "localhost" ]] && insecure="false"
   node=$(jq -n \
     --arg tag "${tag}" \
     --argjson port "${port}" \
@@ -2738,11 +3165,11 @@ menu_config_hysteria() {
   fi
   fw_allow_udp "${port}"
   fw_allow_tcp "${port}"
-  if apply_hysteria_config && apply_xray_config; then
+  if apply_all_configs; then
     end_config_op_ok
-    show_share_and_qr "Hysteria 节点已创建" "$(hysteria_share_link "${node}")"
+    show_share_and_qr "Hysteria2（sing-box）节点已创建" "$(hysteria_share_link "${node}")"
   else
-    tui_msg "错误" "写入 Hysteria 配置失败，已回滚。"
+    tui_msg "错误" "写入 sing-box / Nginx 配置失败，已回滚。"
     end_config_op_fail
     return 1
   fi
@@ -2895,18 +3322,18 @@ menu_manage_reality() {
 }
 
 #===============================================================================
-# 菜单：管理 Hysteria
+# 菜单：管理 Hysteria2（sing-box）
 #===============================================================================
 menu_manage_hysteria() {
   local tag json choice port
-  tag=$(select_node_tag hysteria "管理 Hysteria 节点") || return 1
+  tag=$(select_node_tag hysteria "管理 Hysteria2 节点") || return 1
   json=$(node_json_by_tag hysteria "${tag}")
   while true; do
     json=$(node_json_by_tag hysteria "${tag}")
     [[ -n "${json}" ]] || return 0
     local status
     status=$(printf '%s' "${json}" | jq -r '"\(.tag)  端口:\(.port)  状态:\(if .enabled then "启用" else "禁用" end)  出站:\(.outbound // "proxy")"')
-    choice=$(tui_menu "管理 Hysteria" "${status}" \
+    choice=$(tui_menu "管理 Hysteria2" "${status}" \
       "toggle" "启用 / 禁用" \
       "port"   "修改端口" \
       "pass"   "更新密码" \
@@ -2922,29 +3349,27 @@ menu_manage_hysteria() {
         else
           set_node_field hysteria "${tag}" enabled true 1
         fi
-        if apply_hysteria_config && apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        if apply_all_configs; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
       port)
         begin_config_op
         local oldport
         oldport=$(printf '%s' "${json}" | jq -r '.port')
-        port=$(tui_input "修改端口" "新端口" "${oldport}") || { end_config_op_cancel; continue; }
-        assert_port_free "${port}" "${tag}" || { end_config_op_cancel; continue; }
+        port=$(tui_input "修改端口" "新 UDP 端口" "${oldport}") || { end_config_op_cancel; continue; }
+        assert_udp_port_free "${port}" "${tag}" || { end_config_op_cancel; continue; }
         set_node_field hysteria "${tag}" port "${port}" 1
         set_node_field hysteria "${tag}" tag "hysteria-${port}"
-        systemctl stop "hysteria@${oldport}" >/dev/null 2>&1 || true
-        systemctl disable "hysteria@${oldport}" >/dev/null 2>&1 || true
         fw_allow_udp "${port}"
         fw_allow_tcp "${port}"
         tag="hysteria-${port}"
-        if apply_hysteria_config && apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        if apply_all_configs; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
       pass)
         begin_config_op
         local pw
         pw=$(tui_input "更新密码" "新密码" "$(printf '%s' "${json}" | jq -r '.password')") || { end_config_op_cancel; continue; }
         set_node_field hysteria "${tag}" password "${pw}"
-        if apply_hysteria_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        if apply_all_configs; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
       out)
         begin_config_op
@@ -2954,19 +3379,16 @@ menu_manage_hysteria() {
           "direct" "直连" \
           "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
         set_node_field hysteria "${tag}" outbound "${ob}"
-        if apply_hysteria_config && apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
+        if apply_all_configs; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
       share)
-        show_share_and_qr "Hysteria 分享链接" "$(hysteria_share_link "${json}")"
+        show_share_and_qr "Hysteria2 分享链接" "$(hysteria_share_link "${json}")"
         ;;
       del)
         begin_config_op
         if tui_yesno "删除节点" "确认删除 ${tag}？"; then
-          port=$(printf '%s' "${json}" | jq -r '.port')
           delete_node hysteria "${tag}"
-          systemctl stop "hysteria@${port}" >/dev/null 2>&1 || true
-          systemctl disable "hysteria@${port}" >/dev/null 2>&1 || true
-          if apply_hysteria_config && apply_xray_config; then end_config_op_ok; tui_msg "完成" "节点已删除"; return 0
+          if apply_all_configs; then end_config_op_ok; tui_msg "完成" "节点已删除"; return 0
           else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         else
           end_config_op_cancel
@@ -3087,9 +3509,10 @@ menu_backup() {
   dest="/root/xcc-backup-${stamp}.tar.gz"
   mkdir -p "${XCC_DIR}/export"
   cp -a "${XRAY_CONF}" "${XCC_DIR}/export/xray-config.json" 2>/dev/null || true
-  if [[ -d "${HYSTERIA_DIR}" ]]; then
-    rm -rf "${XCC_DIR}/export/hysteria"
-    cp -a "${HYSTERIA_DIR}" "${XCC_DIR}/export/hysteria" 2>/dev/null || true
+  if [[ -d "${SINGBOX_DIR}" ]]; then
+    rm -rf "${XCC_DIR}/export/sing-box" "${XCC_DIR}/export/hysteria"
+    cp -a "${SINGBOX_DIR}" "${XCC_DIR}/export/sing-box" 2>/dev/null || true
+    cp -a "${SINGBOX_DIR}" "${XCC_DIR}/export/hysteria" 2>/dev/null || true
   fi
   if tar -czf "${dest}" -C /etc xcc; then
     chmod 600 "${dest}"
@@ -3128,9 +3551,12 @@ menu_restore() {
   if [[ -f "${XCC_DIR}/export/xray-config.json" ]]; then
     cp -a "${XCC_DIR}/export/xray-config.json" "${XRAY_CONF}"
   fi
-  if [[ -d "${XCC_DIR}/export/hysteria" ]]; then
-    mkdir -p "${HYSTERIA_DIR}"
-    cp -a "${XCC_DIR}/export/hysteria/." "${HYSTERIA_DIR}/"
+  if [[ -d "${XCC_DIR}/export/sing-box" ]]; then
+    mkdir -p "${SINGBOX_DIR}"
+    cp -a "${XCC_DIR}/export/sing-box/." "${SINGBOX_DIR}/"
+  elif [[ -d "${XCC_DIR}/export/hysteria" ]]; then
+    mkdir -p "${SINGBOX_DIR}"
+    cp -a "${XCC_DIR}/export/hysteria/." "${SINGBOX_DIR}/"
   fi
   chmod 600 "${XCC_NODES}" "${XCC_OUTBOUND}" "${XRAY_CONF}" 2>/dev/null || true
   if apply_all_configs; then
@@ -3152,26 +3578,31 @@ do_uninstall() {
   systemctl disable xcc-watchdog >/dev/null 2>&1 || true
   systemctl disable --now xcc-sub >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/xcc-sub.service
+  stop_legacy_hysteria
   if [[ "${also}" == "ask" ]]; then
-    if tui_yesno "卸载组件" "是否同时卸载 Xray 和 Hysteria？"; then
+    if tui_yesno "卸载组件" "是否同时卸载 Xray、sing-box，并移除 Nginx 站点配置？"; then
       also="yes"
     else
       also="no"
     fi
   fi
+  rm -f "${NGINX_CONF}"
+  if command -v nginx >/dev/null 2>&1; then
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+  fi
+  systemctl disable --now sing-box >/dev/null 2>&1 || true
   if [[ "${also}" == "yes" ]]; then
     systemctl stop xray >/dev/null 2>&1 || true
     systemctl disable xray >/dev/null 2>&1 || true
-    systemctl list-units --full --all --type=service --no-legend 'hysteria@*' 2>/dev/null \
-      | awk '{print $1}' | while read -r unit; do
-          [[ -n "${unit}" ]] || continue
-          systemctl stop "${unit}" >/dev/null 2>&1 || true
-          systemctl disable "${unit}" >/dev/null 2>&1 || true
-        done
-    rm -f "${XRAY_BIN}" "${HYSTERIA_BIN}"
-    rm -rf /usr/local/etc/xray "${HYSTERIA_DIR}"
+    systemctl stop sing-box >/dev/null 2>&1 || true
+    rm -f "${XRAY_BIN}" "${SINGBOX_BIN}"
+    rm -rf /usr/local/etc/xray "${SINGBOX_DIR}"
+    if [[ -x /usr/local/bin/hysteria ]]; then
+      rm -f /usr/local/bin/hysteria
+    fi
+    rm -rf /etc/hysteria
   fi
-  rm -f "${WATCHDOG_UNIT}" "${HYSTERIA_UNIT}" "${LOGROTATE_CONF}"
+  rm -f "${WATCHDOG_UNIT}" "${SINGBOX_UNIT}" "${LOGROTATE_CONF}"
   systemctl daemon-reload || true
   rm -rf "${XCC_DIR}" "${XCC_TMP_DIR}"
   rm -f "${XCC_BIN}"
@@ -3315,16 +3746,24 @@ watchdog_check_xray() {
   watchdog_record_restart
 }
 
-watchdog_check_hysteria() {
-  local p
+watchdog_check_singbox() {
+  local n
   [[ -f "${XCC_NODES}" ]] || return 0
-  jq -r '.hysteria[]? | select(.enabled==true) | .port' "${XCC_NODES}" 2>/dev/null | while read -r p; do
-    [[ -n "${p}" ]] || continue
-    if ! is_svc_active "hysteria@${p}"; then
-      xcc_log WARN "Hysteria@${p} 未运行，正在重启"
-      systemctl restart "hysteria@${p}" >/dev/null 2>&1 || true
-    fi
-  done
+  n=$(jq '[.hysteria[]? | select(.enabled==true)] | length' "${XCC_NODES}" 2>/dev/null || echo 0)
+  [[ "${n}" -gt 0 ]] || return 0
+  if ! is_svc_active sing-box; then
+    xcc_log WARN "sing-box 未运行，正在重启"
+    systemctl restart sing-box >/dev/null 2>&1 || true
+  fi
+}
+
+watchdog_check_nginx() {
+  command -v nginx >/dev/null 2>&1 || return 0
+  [[ -f "${NGINX_CONF}" ]] || return 0
+  if ! is_svc_active nginx; then
+    xcc_log WARN "Nginx 未运行，正在重启"
+    systemctl restart nginx >/dev/null 2>&1 || true
+  fi
 }
 
 watchdog_check_outbound() {
@@ -3357,7 +3796,8 @@ cmd_watchdog() {
     watchdog_disk
     watchdog_load
     watchdog_check_xray
-    watchdog_check_hysteria
+    watchdog_check_singbox
+    watchdog_check_nginx
     watchdog_check_outbound
     sleep 60
   done
@@ -3384,7 +3824,7 @@ main_menu() {
     extra=$'\n'"⚠ 看门狗保护已触发，Xray 不会自动重启。可选择重置。"
   fi
   while true; do
-    choice=$(tui_menu "xcc 主菜单" "v2.0 多协议管理（参考 v2ray-agent / 3x-ui，仍为单机单用户）${extra}" \
+    choice=$(tui_menu "xcc 主菜单" "v2.1 多协议管理（Xray + sing-box Hysteria2 + Nginx，单机单用户）${extra}" \
       "d" "状态面板 / 流量" \
       "q" "一键 Reality（无域名）" \
       "1" "配置 Reality 节点" \
@@ -3399,7 +3839,7 @@ main_menu() {
       "c" "证书（ACME）" \
       "b" "启用 BBR 加速" \
       "6" "设置 SSH 端口" \
-      "k" "更新核心（Xray/Hysteria/xcc）" \
+      "k" "更新核心（Xray/sing-box/Nginx/xcc）" \
       "7" "备份配置" \
       "8" "恢复配置" \
       "9" "卸载 xcc" \
@@ -3453,7 +3893,7 @@ cmd_version() {
 
 usage() {
   cat <<EOF
-xcc ${XCC_VERSION} - Xray / Hysteria 节点管理工具（仅支持单用户配置）
+xcc ${XCC_VERSION} - Xray / sing-box / Nginx 节点管理工具（仅支持单用户配置）
 
 Usage:
   xcc              显示本帮助
