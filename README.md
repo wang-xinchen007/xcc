@@ -1,23 +1,20 @@
 # xcc
 
-Xray Reality + Hysteria 节点管理工具（**仅支持单用户配置**）。
+Xray 多协议节点管理工具（**单机单用户**）。TUI 参考 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 的菜单流，能力参考 [3x-ui](https://github.com/MHSanaei/3x-ui) 的入站 / 流量 / 订阅 / 分流，全部收敛在一个 Bash 脚本里。
 
-一个 Bash 主脚本，通过 `xcc run` 进入中文 TUI（whiptail / dialog），覆盖节点配置、出站代理、SSH 端口、备份恢复、systemd 看门狗与日志自维护。
-
-目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+（次要）。依赖 systemd。
+目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+。依赖 systemd。当前版本 **2.0.0**。
 
 ## 功能介绍
 
-- 一键环境检测与依赖安装（curl、jq、unzip、bc、dialog、qrencode、apparmor-utils 等）
-- 按顺序安装：先依赖 → 再 `curl -f` 下载 Xray 官方脚本 → 最后执行安装（最新 TLS / Reality 版本）
-- 从 GitHub Release 安装最新 Hysteria 预编译二进制
-- 配置 / 管理 VLESS + Reality（TLS 1.3、`xtls-rprx-vision`、fingerprint=`chrome`）
-- 配置 / 管理 Hysteria 2（ACME 或自签名、salamander 混淆）
-- 节点级出站：Shifter（SOCKS5）或直连；路由顺序为 Hysteria → Reality → 默认出站
-- 修改 SSH 端口（备份、`sshd -t` 校验、防火墙放行、失败回滚）
-- 备份 / 恢复 `/etc/xcc`
-- systemd 看门狗：进程自愈、出口 IP 检查、磁盘 / 负载监控、日志轮转
-- **配置修改时自动暂停看门狗**，避免误重启；成功或失败后都会恢复
+- 状态面板：CPU / 内存 / 磁盘 / 负载 / 公网 IP / 服务状态 / Xray Stats 流量
+- 一键无域名 Reality（www.microsoft.com 伪装，TLS 1.3 + xtls-rprx-vision + fp=chrome）
+- 协议：VLESS Reality、VLESS-WS-TLS、VMess-WS-TLS、Trojan-TLS、Shadowsocks 2022、Hysteria2
+- ACME（Let's Encrypt / acme.sh）或自签名证书
+- 通用订阅（base64 HTTP）+ 分享链接 / 二维码
+- 出站：SOCKS5（Shifter）、直连、Cloudflare WARP（wgcf → Xray wireguard）
+- 分流：BT 阻断、广告拦截、国内直连、域名黑名单
+- BBR 加速、SSH 端口、备份恢复、核心更新
+- systemd 看门狗；**改配置时自动暂停看门狗**
 
 ## 安装命令
 
@@ -55,6 +52,7 @@ sudo xcc run
 ```text
 xcc              显示帮助（Usage）
 xcc run          启动中文 TUI
+xcc status       状态面板
 xcc update       从 GitHub 更新主脚本（保留 /etc/xcc/ 配置）
 xcc uninstall    卸载（需输入 yes 确认）
 xcc version      显示版本
@@ -67,22 +65,23 @@ xcc version      显示版本
 ## 使用截图（TUI 示意）
 
 ```text
-┌────────────── xcc 1.0.0  |  仅支持单用户配置 ──────────────┐
+┌────────────── xcc 2.0.0  |  仅支持单用户配置 ──────────────┐
 │ xcc 主菜单                                                 │
-│ 请选择操作（仅支持单用户配置）                             │
 │                                                            │
+│     d  状态面板 / 流量                                     │
+│     q  一键 Reality（无域名）                              │
 │     1  配置 Reality 节点                                   │
-│     2  配置 Hysteria 节点                                  │
-│     3  管理 Reality 节点                                   │
-│     4  管理 Hysteria 节点                                  │
-│     5  设置出站代理                                        │
-│     6  设置新的 SSH 连接端口                               │
-│     7  备份配置                                            │
-│     8  恢复配置                                            │
-│     9  卸载 xcc                                            │
-│     r  重置看门狗保护                                      │
+│     2  配置 Hysteria2 节点                                 │
+│     v  配置 VLESS-WS-TLS                                   │
+│     m  配置 VMess-WS-TLS                                   │
+│     t  配置 Trojan-TLS                                     │
+│     s  配置 Shadowsocks 2022                               │
+│     3  管理节点                                            │
+│     u  订阅 / 分享链接                                     │
+│     5  出站 / WARP / 分流                                  │
+│     c  证书（ACME）                                        │
+│     b  启用 BBR 加速                                       │
 │     0  退出                                                │
-│                                                            │
 │                    <确定>          <取消>                  │
 └────────────────────────────────────────────────────────────┘
 ```

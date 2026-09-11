@@ -2,7 +2,7 @@
 #===============================================================================
 #  xcc - Xray / Hysteria 节点管理工具
 #  Author : xcc
-#  Version: 1.0.0
+#  Version: 2.0.0
 #  Description: 单用户 Reality + Hysteria 节点管理（中文 TUI）
 #               仅支持单用户配置。目标系统：Ubuntu 24.04+ / Debian 12+ / CentOS 9+
 #===============================================================================
@@ -22,8 +22,8 @@ NC='\033[0m'
 #-------------------------------------------------------------------------------
 # 版本与仓库
 #-------------------------------------------------------------------------------
-XCC_VERSION="1.0.1"
-XCC_CONFIG_FORMAT="1"
+XCC_VERSION="2.0.0"
+XCC_CONFIG_FORMAT="2"
 XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
 XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
 XCC_GITHUB_BRANCH="${XCC_GITHUB_BRANCH:-main}"
@@ -48,6 +48,11 @@ XRAY_CONF="/usr/local/etc/xray/config.json"
 HYSTERIA_BIN="/usr/local/bin/hysteria"
 HYSTERIA_DIR="/etc/hysteria"
 HYSTERIA_CONF="${HYSTERIA_DIR}/config.json"
+XCC_CERT_DIR="${XCC_DIR}/certs"
+XCC_SUB_DIR="${XCC_DIR}/subscribe"
+XCC_WARP_FILE="${XCC_DIR}/warp.json"
+XCC_SETTINGS_DEFAULT='{"block_bt":true,"block_ads":false,"cn_direct":false,"domain_block":[],"sub_token":"","sub_port":2096,"cert":"","key":"","domain":"","warp":false}'
+XRAY_API_ADDR="127.0.0.1:10085"
 WATCHDOG_HALT="${XCC_DIR}/.watchdog-halt"
 WATCHDOG_RESTARTS="${XCC_DIR}/.watchdog-restarts"
 LOGROTATE_CONF="/etc/logrotate.d/xcc"
@@ -294,7 +299,7 @@ ensure_deps() {
 
   detect_os
 
-  pkgs=(curl jq unzip bc openssl ca-certificates)
+  pkgs=(curl jq unzip bc openssl ca-certificates python3)
   if [[ "${PKG_MGR}" == "apt" ]]; then
     pkgs+=(dialog qrencode whiptail apparmor-utils)
   else
@@ -385,11 +390,11 @@ tui_menu() {
   case "${TUI_BACKEND}" in
     whiptail)
       choice=$(whiptail --backtitle "${XCC_BACKTITLE}" --title "${title}" \
-        --menu "${text}" 22 78 12 "$@" 3>&1 1>&2 2>&3) || return 1
+        --menu "${text}" 22 78 14 "$@" 3>&1 1>&2 2>&3) || return 1
       ;;
     dialog)
       choice=$(dialog --backtitle "${XCC_BACKTITLE}" --title "${title}" \
-        --menu "${text}" 22 78 12 "$@" 3>&1 1>&2 2>&3) || return 1
+        --menu "${text}" 22 78 14 "$@" 3>&1 1>&2 2>&3) || return 1
       clear
       ;;
     cli)
@@ -741,11 +746,14 @@ fw_delete_tcp() {
 #===============================================================================
 ensure_dirs() {
   mkdir -p "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${HYSTERIA_DIR}" \
+    "${XCC_CERT_DIR}" "${XCC_SUB_DIR}" \
     "$(dirname "${XRAY_CONF}")" "${XCC_TMP_DIR}" "${XCC_CACHE_DIR}"
-  chmod 700 "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${HYSTERIA_DIR}"
+  chmod 700 "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${HYSTERIA_DIR}" "${XCC_CERT_DIR}"
   if [[ ! -f "${XCC_NODES}" ]]; then
-    printf '%s\n' '{"reality":[],"hysteria":[]}' > "${XCC_NODES}"
+    printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vmess":[],"trojan":[],"shadowsocks":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${XCC_NODES}"
     chmod 600 "${XCC_NODES}"
+  else
+    migrate_nodes_json
   fi
   if [[ ! -f "${XCC_VERSION_FILE}" ]]; then
     printf '%s\n' "${XCC_CONFIG_FORMAT}" > "${XCC_VERSION_FILE}"
@@ -756,11 +764,31 @@ ensure_dirs() {
   fi
 }
 
+# 兼容 1.x nodes.json，补齐 2.0 字段。
+migrate_nodes_json() {
+  [[ -f "${XCC_NODES}" ]] || return 0
+  local tmp
+  tmp=$(xcc_mktemp)
+  if jq --argjson st "${XCC_SETTINGS_DEFAULT}" '
+      .vless_ws //= []
+      | .vmess //= []
+      | .trojan //= []
+      | .shadowsocks //= []
+      | .settings = ($st + (.settings // {}))
+    ' "${XCC_NODES}" > "${tmp}" 2>/dev/null; then
+    mv "${tmp}" "${XCC_NODES}"
+    chmod 600 "${XCC_NODES}"
+  else
+    rm -f "${tmp}"
+  fi
+}
+
 check_config_format() {
   local ver
   ver=$(tr -d ' \n' < "${XCC_VERSION_FILE}" 2>/dev/null || echo "")
   if [[ -n "${ver}" && "${ver}" != "${XCC_CONFIG_FORMAT}" ]]; then
-    add_warning "配置格式已变更，建议重新配置。"
+    add_warning "配置格式已从 ${ver} 升级到 ${XCC_CONFIG_FORMAT}，已自动迁移旧节点。"
+    printf '%s\n' "${XCC_CONFIG_FORMAT}" > "${XCC_VERSION_FILE}"
   fi
 }
 
@@ -1223,10 +1251,11 @@ hysteria_test_config() {
 }
 
 # 根据 nodes.json + outbound.conf 重建 Xray 配置。
-# 路由顺序：Hysteria 入站（若有对应 tag）→ Reality 入站 → 默认出站。
+# 路由：API → BT/广告/域名黑名单 → 各入站独立出站 → CN 直连 → 默认出站。
 apply_xray_config() {
-  local tmp dns_json mode proxy_json node_json
+  local tmp dns_json mode proxy_json node_json warp_json has_geo
   ensure_xray_inbounds_array
+  migrate_nodes_json
   dns_json=$(dns_servers_json)
   mode=$(outbound_mode)
 
@@ -1255,6 +1284,15 @@ apply_xray_config() {
     proxy_json='{"tag":"proxy","protocol":"freedom","settings":{}}'
   fi
 
+  warp_json='null'
+  if [[ -f "${XCC_WARP_FILE}" ]] && jq empty "${XCC_WARP_FILE}" 2>/dev/null; then
+    warp_json=$(cat "${XCC_WARP_FILE}")
+  fi
+  has_geo="false"
+  if [[ -f /usr/local/share/xray/geosite.dat || -f /usr/local/share/xray/geoip.dat ]]; then
+    has_geo="true"
+  fi
+
   node_json=$(cat "${XCC_NODES}")
   tmp=$(xcc_mktemp)
 
@@ -1262,49 +1300,127 @@ apply_xray_config() {
     --argjson dns "${dns_json}" \
     --argjson nodes "${node_json}" \
     --argjson proxy "${proxy_json}" \
+    --argjson warp "${warp_json}" \
+    --argjson has_geo "${has_geo}" \
     --arg default_tag "$( [[ "${mode}" == "proxy" ]] && echo proxy || echo direct )" \
     '
+    def sniff: {enabled:true, destOverride:["http","tls","quic"]};
+    def certfile:
+      if (.cert // "") != "" then .cert
+      else ($nodes.settings.cert // "/etc/xcc/certs/fullchain.pem") end;
+    def keyfile:
+      if (.key // "") != "" then .key
+      else ($nodes.settings.key // "/etc/xcc/certs/privkey.pem") end;
+    def tls_ss($network):
+      {
+        network: $network,
+        security: "tls",
+        tlsSettings: {
+          minVersion: "1.3",
+          maxVersion: "1.3",
+          certificates: [{certificateFile: certfile, keyFile: keyfile}]
+        }
+      }
+      + (if $network == "ws" then {
+           wsSettings: {path: (.path // "/xcc"), headers: {Host: (.host // .sni // "")}}
+         } else {} end);
     def reality_inbound:
       {
-        tag: .tag,
-        listen: "0.0.0.0",
-        port: .port,
-        protocol: "vless",
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vless",
         settings: {
-          clients: [{id: .uuid, flow: (.flow // "xtls-rprx-vision"), email: "xcc"}],
+          clients: [{id: .uuid, flow: (.flow // "xtls-rprx-vision"), email: (.email // "xcc")}],
           decryption: "none"
         },
         streamSettings: {
-          network: "tcp",
-          security: "reality",
-          tls: "1.3",
+          network: "tcp", security: "reality", tls: "1.3",
           realitySettings: {
-            show: false,
-            dest: .dest,
-            xver: 0,
-            serverNames: [.sni],
-            privateKey: .private_key,
+            show: false, dest: .dest, xver: 0,
+            serverNames: [.sni], privateKey: .private_key,
             shortIds: [(.short_id // "")]
           }
         },
-        sniffing: {enabled: true, destOverride: ["http","tls","quic"]}
+        sniffing: sniff
       };
+    def vless_ws_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vless",
+        settings: {clients: [{id: .uuid, email: (.email // "xcc")}], decryption: "none"},
+        streamSettings: tls_ss("ws"),
+        sniffing: sniff
+      };
+    def vmess_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vmess",
+        settings: {clients: [{id: .uuid, alterId: 0, email: (.email // "xcc")}]},
+        streamSettings: tls_ss(.network // "ws"),
+        sniffing: sniff
+      };
+    def trojan_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "trojan",
+        settings: {clients: [{password: .password, email: (.email // "xcc")}]},
+        streamSettings: tls_ss(.network // "tcp"),
+        sniffing: sniff
+      };
+    def ss_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "shadowsocks",
+        settings: {
+          method: (.method // "2022-blake3-aes-128-gcm"),
+          password: .password,
+          network: "tcp,udp"
+        },
+        sniffing: sniff
+      };
+    def node_rule:
+      {type:"field", inboundTag:[.tag], outboundTag:(.outbound // $default_tag)};
+    def api_in:
+      {listen:"127.0.0.1", port:10085, protocol:"dokodemo-door", settings:{address:"127.0.0.1"}, tag:"api"};
 
+    ($nodes.settings // {}) as $st |
     {
       log: {loglevel: "warning"},
+      stats: {},
+      api: {tag: "api", services: ["StatsService", "HandlerService"]},
+      policy: {
+        levels: {"0": {statsUserUplink: true, statsUserDownlink: true}},
+        system: {
+          statsInboundUplink: true, statsInboundDownlink: true,
+          statsOutboundUplink: true, statsOutboundDownlink: true
+        }
+      },
       dns: {servers: $dns},
-      inbounds: [ $nodes.reality[]? | select(.enabled == true) | reality_inbound ],
-      outbounds: [
-        (if $default_tag == "proxy" then $proxy else {tag:"direct", protocol:"freedom", settings:{}} end),
-        (if $default_tag == "proxy" then {tag:"direct", protocol:"freedom", settings:{}} else $proxy end),
-        {tag:"block", protocol:"blackhole", settings:{}}
-      ],
+      inbounds:
+        [api_in]
+        + [ $nodes.reality[]?     | select(.enabled == true) | reality_inbound ]
+        + [ $nodes.vless_ws[]?    | select(.enabled == true) | vless_ws_inbound ]
+        + [ $nodes.vmess[]?       | select(.enabled == true) | vmess_inbound ]
+        + [ $nodes.trojan[]?      | select(.enabled == true) | trojan_inbound ]
+        + [ $nodes.shadowsocks[]? | select(.enabled == true) | ss_inbound ],
+      outbounds:
+        (
+          [ (if $default_tag == "proxy" then $proxy else {tag:"direct", protocol:"freedom", settings:{}} end),
+            (if $default_tag == "proxy" then {tag:"direct", protocol:"freedom", settings:{}} else $proxy end),
+            {tag:"block", protocol:"blackhole", settings:{}} ]
+          + (if $warp != null then [$warp] else [] end)
+        ),
       routing: {
         domainStrategy: "AsIs",
         rules:
-          ([ $nodes.hysteria[]? | select(.enabled == true) | {type:"field", inboundTag:[.tag], outboundTag:(.outbound // $default_tag)} ])
-          +
-          ([ $nodes.reality[]? | select(.enabled == true) | {type:"field", inboundTag:[.tag], outboundTag:(.outbound // $default_tag)} ])
+          [ {type:"field", inboundTag:["api"], outboundTag:"api"} ]
+          + (if ($st.block_bt // true) then [{type:"field", protocol:["bittorrent"], outboundTag:"block"}] else [] end)
+          + (if ($st.block_ads // false) and $has_geo then [{type:"field", domain:["geosite:category-ads-all"], outboundTag:"block"}] else [] end)
+          + (if (($st.domain_block // [])|length) > 0 then [{type:"field", domain:($st.domain_block), outboundTag:"block"}] else [] end)
+          + [ $nodes.hysteria[]?     | select(.enabled == true) | node_rule ]
+          + [ $nodes.shadowsocks[]?  | select(.enabled == true) | node_rule ]
+          + [ $nodes.trojan[]?       | select(.enabled == true) | node_rule ]
+          + [ $nodes.vmess[]?        | select(.enabled == true) | node_rule ]
+          + [ $nodes.vless_ws[]?     | select(.enabled == true) | node_rule ]
+          + [ $nodes.reality[]?      | select(.enabled == true) | node_rule ]
+          + (if ($st.cn_direct // false) and $has_geo then [
+               {type:"field", domain:["geosite:cn"], outboundTag:"direct"},
+               {type:"field", ip:["geoip:cn"], outboundTag:"direct"}
+             ] else [] end)
       }
     }
     ' > "${tmp}"
@@ -1539,6 +1655,635 @@ show_share_and_qr() {
   rm -f "${tmp}"
 }
 
+urlencode() {
+  jq -nr --arg v "$1" '$v|@uri'
+}
+
+vless_ws_share_link() {
+  local json="$1" ip uuid port sni host path
+  ip=$(public_ip)
+  uuid=$(printf '%s' "${json}" | jq -r '.uuid')
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  sni=$(printf '%s' "${json}" | jq -r '.sni // .host // empty')
+  host=$(printf '%s' "${json}" | jq -r '.host // .sni // empty')
+  path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
+  printf 'vless://%s@%s:%s?encryption=none&security=tls&sni=%s&fp=chrome&type=ws&host=%s&path=%s#xcc-vlessws-%s\n' \
+    "${uuid}" "${ip}" "${port}" "$(urlencode "${sni}")" "$(urlencode "${host}")" "$(urlencode "${path}")" "${port}"
+}
+
+vmess_share_link() {
+  local json="$1" ip payload
+  ip=$(public_ip)
+  payload=$(printf '%s' "${json}" | jq -c --arg ip "${ip}" '{
+      v:"2", ps:("xcc-vmess-" + (.port|tostring)), add:$ip, port:(.port|tostring),
+      id:.uuid, aid:"0", scy:"auto", net:(.network // "ws"), type:"none",
+      host:(.host // .sni // ""), path:(.path // "/xcc"), tls:"tls",
+      sni:(.sni // .host // ""), fp:"chrome"
+    }')
+  printf 'vmess://%s\n' "$(printf '%s' "${payload}" | base64 -w0 2>/dev/null || printf '%s' "${payload}" | base64)"
+}
+
+trojan_share_link() {
+  local json="$1" ip port sni pass
+  ip=$(public_ip)
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  sni=$(printf '%s' "${json}" | jq -r '.sni // empty')
+  pass=$(printf '%s' "${json}" | jq -r '.password')
+  printf 'trojan://%s@%s:%s?security=tls&sni=%s&fp=chrome&type=tcp#xcc-trojan-%s\n' \
+    "$(urlencode "${pass}")" "${ip}" "${port}" "$(urlencode "${sni}")" "${port}"
+}
+
+ss_share_link() {
+  local json="$1" ip port method pass userinfo
+  ip=$(public_ip)
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  method=$(printf '%s' "${json}" | jq -r '.method // "2022-blake3-aes-128-gcm"')
+  pass=$(printf '%s' "${json}" | jq -r '.password')
+  userinfo=$(printf '%s:%s' "${method}" "${pass}" | base64 -w0 2>/dev/null || printf '%s:%s' "${method}" "${pass}" | base64)
+  printf 'ss://%s@%s:%s#xcc-ss-%s\n' "${userinfo}" "${ip}" "${port}" "${port}"
+}
+
+node_share_link() {
+  local kind="$1" json="$2"
+  case "${kind}" in
+    reality) reality_share_link "${json}" ;;
+    hysteria) hysteria_share_link "${json}" ;;
+    vless_ws) vless_ws_share_link "${json}" ;;
+    vmess) vmess_share_link "${json}" ;;
+    trojan) trojan_share_link "${json}" ;;
+    shadowsocks) ss_share_link "${json}" ;;
+  esac
+}
+
+collect_all_links() {
+  local kind json
+  migrate_nodes_json
+  for kind in reality vless_ws vmess trojan shadowsocks hysteria; do
+    while IFS= read -r json; do
+      [[ -n "${json}" ]] || continue
+      node_share_link "${kind}" "${json}"
+    done < <(jq -c --arg k "${kind}" '.[$k][]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+  done
+}
+
+ensure_sub_token() {
+  local tok
+  tok=$(jq -r '.settings.sub_token // empty' "${XCC_NODES}")
+  if [[ -z "${tok}" ]]; then
+    tok=$(rand_alnum 24)
+    set_settings_field sub_token "${tok}"
+  fi
+  printf '%s' "${tok}"
+}
+
+set_settings_field() {
+  local key="$1" val="$2" is_json="${3:-0}" tmp
+  tmp=$(xcc_mktemp)
+  if [[ "${is_json}" -eq 1 ]]; then
+    jq --arg k "${key}" --argjson v "${val}" '.settings[$k]=$v' "${XCC_NODES}" > "${tmp}"
+  else
+    jq --arg k "${key}" --arg v "${val}" '.settings[$k]=$v' "${XCC_NODES}" > "${tmp}"
+  fi
+  mv "${tmp}" "${XCC_NODES}"
+  chmod 600 "${XCC_NODES}"
+}
+
+rebuild_subscribe() {
+  local tok port ip raw
+  migrate_nodes_json
+  mkdir -p "${XCC_SUB_DIR}"
+  chmod 755 "${XCC_SUB_DIR}"
+  tok=$(ensure_sub_token)
+  port=$(jq -r '.settings.sub_port // 2096' "${XCC_NODES}")
+  ip=$(public_ip)
+  raw="${XCC_SUB_DIR}/raw.txt"
+  collect_all_links > "${raw}"
+  (base64 -w0 "${raw}" 2>/dev/null || base64 "${raw}") > "${XCC_SUB_DIR}/${tok}"
+  chmod 644 "${XCC_SUB_DIR}/${tok}" "${raw}"
+  local py
+  py=$(command -v python3 || echo /usr/bin/python3)
+  cat > /etc/systemd/system/xcc-sub.service <<EOF
+[Unit]
+Description=xcc subscription HTTP
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=${XCC_SUB_DIR}
+ExecStart=${py} -m http.server ${port} --bind 0.0.0.0
+Restart=always
+RestartSec=3
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  fw_allow_tcp "${port}"
+  systemctl enable --now xcc-sub >/dev/null 2>&1 || systemctl restart xcc-sub
+  printf 'http://%s:%s/%s\n' "${ip}" "${port}" "${tok}"
+}
+
+bytes_human() {
+  local n="${1:-0}"
+  awk -v n="${n}" 'BEGIN{
+    split("B KB MB GB TB", u, " ");
+    i=1; while (n>=1024 && i<5) {n/=1024; i++}
+    printf "%.2f %s", n, u[i]
+  }'
+}
+
+#===============================================================================
+# 状态面板（参考 3x-ui dashboard）
+#===============================================================================
+menu_dashboard() {
+  local tmp cpu mem disk up load1 cores xst hst wst ver_x ver_h ip
+  tmp=$(xcc_mktemp)
+  cpu=$(grep -c ^processor /proc/cpuinfo 2>/dev/null || nproc)
+  mem=$(free -h | awk '/Mem:/{print $3" / "$2}')
+  disk=$(df -h / | awk 'NR==2{print $3" / "$2" ("$5")"}')
+  up=$(uptime -p 2>/dev/null || uptime)
+  load1=$(awk '{print $1}' /proc/loadavg)
+  cores=$(nproc)
+  xst=$(systemctl is-active xray 2>/dev/null || echo unknown)
+  wst=$(systemctl is-active xcc-watchdog 2>/dev/null || echo unknown)
+  hst=$(systemctl is-active 'hysteria@*' 2>/dev/null | head -n1 || echo inactive)
+  ver_x=$(xray_installed_version || echo -)
+  ver_h=$(hysteria_installed_version || echo -)
+  ip=$(public_ip)
+  {
+    echo "===== xcc ${XCC_VERSION} 状态面板 ====="
+    echo "主机: $(hostname)    系统: ${OS_ID:-?} ${OS_VERSION_ID:-?}"
+    echo "公网 IP: ${ip}"
+    echo "CPU: ${cpu} 核    负载: ${load1} (阈值 $((cores * 2)))"
+    echo "内存: ${mem}"
+    echo "磁盘: ${disk}"
+    echo "运行时间: ${up}"
+    echo
+    echo "Xray: ${xst}  ${ver_x}"
+    echo "Hysteria: ${hst}  ${ver_h}"
+    echo "看门狗: ${wst}"
+    echo
+    echo "----- 节点 -----"
+    jq -r '
+      def line($k):
+        (.[$k][]? | "  \($k)\t\(.tag)\tport=\(.port)\t\(if .enabled then "启用" else "禁用" end)\tout=\(.outbound // "proxy")");
+      line("reality"), line("vless_ws"), line("vmess"), line("trojan"), line("shadowsocks"), line("hysteria")
+    ' "${XCC_NODES}" 2>/dev/null || true
+    echo
+    echo "----- 流量 (Xray Stats API) -----"
+    if command -v "${XRAY_BIN}" >/dev/null && is_svc_active xray; then
+      "${XRAY_BIN}" api statsquery --server="${XRAY_API_ADDR}" 2>/dev/null \
+        | jq -r '.stat[]? | select(.name|test("traffic")) | "\(.name)\t\(.value)"' 2>/dev/null \
+        | while IFS=$'\t' read -r name val; do
+            printf '  %s  %s\n' "${name}" "$(bytes_human "${val}")"
+          done
+      echo "(无输出表示尚未产生流量或 API 未就绪)"
+    else
+      echo "  Xray 未运行，无法读取流量。"
+    fi
+  } > "${tmp}"
+  tui_textbox_file "状态面板" "${tmp}"
+  rm -f "${tmp}"
+}
+
+#===============================================================================
+# 证书 ACME / 自签名（参考 v2ray-agent 自动 TLS）
+#===============================================================================
+make_self_signed() {
+  local cn="${1:-localhost}"
+  mkdir -p "${XCC_CERT_DIR}"
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 3650 -nodes \
+    -keyout "${XCC_CERT_DIR}/privkey.pem" -out "${XCC_CERT_DIR}/fullchain.pem" \
+    -subj "/CN=${cn}" >/dev/null 2>&1
+  chmod 600 "${XCC_CERT_DIR}/privkey.pem"
+  set_settings_field cert "${XCC_CERT_DIR}/fullchain.pem"
+  set_settings_field key "${XCC_CERT_DIR}/privkey.pem"
+  set_settings_field domain "${cn}"
+}
+
+install_acme_sh() {
+  if [[ -x "${HOME}/.acme.sh/acme.sh" ]]; then
+    return 0
+  fi
+  info "正在安装 acme.sh ..."
+  curl -fsSL https://get.acme.sh | sh -s -- --install-online >/dev/null 2>&1 \
+    || curl -fsSL https://cdn.jsdelivr.net/gh/acmesh-official/acme.sh@master/acme.sh | sh -s -- --install-online
+}
+
+issue_acme_cert() {
+  local domain="$1" email="${2:-admin@${1}}"
+  [[ -n "${domain}" ]] || return 1
+  fw_allow_tcp 80
+  install_acme_sh || return 1
+  "${HOME}/.acme.sh/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+  "${HOME}/.acme.sh/acme.sh" --register-account -m "${email}" >/dev/null 2>&1 || true
+  if ! "${HOME}/.acme.sh/acme.sh" --issue -d "${domain}" --standalone --httpport 80 --force; then
+    tui_msg "错误" "ACME 签发失败。请确认域名已解析到本机，且 80 端口未被占用。"
+    return 1
+  fi
+  mkdir -p "${XCC_CERT_DIR}"
+  "${HOME}/.acme.sh/acme.sh" --install-cert -d "${domain}" \
+    --key-file "${XCC_CERT_DIR}/privkey.pem" \
+    --fullchain-file "${XCC_CERT_DIR}/fullchain.pem" \
+    --reloadcmd "systemctl reload xray || systemctl restart xray"
+  chmod 600 "${XCC_CERT_DIR}/privkey.pem"
+  set_settings_field cert "${XCC_CERT_DIR}/fullchain.pem"
+  set_settings_field key "${XCC_CERT_DIR}/privkey.pem"
+  set_settings_field domain "${domain}"
+}
+
+prompt_tls_files() {
+  local domain="$1"
+  CERT_FILE=$(jq -r '.settings.cert // empty' "${XCC_NODES}")
+  KEY_FILE=$(jq -r '.settings.key // empty' "${XCC_NODES}")
+  if [[ -n "${CERT_FILE}" && -f "${CERT_FILE}" && -f "${KEY_FILE}" ]]; then
+    if tui_yesno "TLS 证书" "已有证书 ${CERT_FILE}，是否继续使用？"; then
+      return 0
+    fi
+  fi
+  if tui_yesno "ACME" "是否用 Let's Encrypt 申请证书？（域名需解析到本机，临时占用 80）"; then
+    issue_acme_cert "${domain}" || return 1
+  else
+    make_self_signed "${domain}"
+    tui_msg "自签名" "已生成自签名证书，客户端需允许不安全连接（仅测试）。"
+  fi
+  CERT_FILE="${XCC_CERT_DIR}/fullchain.pem"
+  KEY_FILE="${XCC_CERT_DIR}/privkey.pem"
+}
+
+menu_certs() {
+  local domain email choice
+  choice=$(tui_menu "证书管理" "当前: $(jq -r '.settings.domain // "未配置"' "${XCC_NODES}")" \
+    "acme" "ACME 申请 / 续签 Let's Encrypt" \
+    "self" "生成自签名证书" \
+    "show" "查看证书路径") || return 0
+  case "${choice}" in
+    acme)
+      begin_config_op
+      domain=$(tui_input "ACME" "域名" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || { end_config_op_cancel; return 1; }
+      email=$(tui_input "ACME" "邮箱" "admin@${domain}") || { end_config_op_cancel; return 1; }
+      if issue_acme_cert "${domain}" "${email}"; then
+        apply_xray_config || true
+        end_config_op_ok
+        tui_msg "完成" "证书已安装到 ${XCC_CERT_DIR}"
+      else
+        end_config_op_fail
+      fi
+      ;;
+    self)
+      domain=$(tui_input "自签名" "CN / 域名" "localhost") || return 1
+      make_self_signed "${domain}"
+      tui_msg "完成" "自签名证书已生成。"
+      ;;
+    show)
+      tui_msg "证书" "cert=$(jq -r '.settings.cert' "${XCC_NODES}")"$'\n'"key=$(jq -r '.settings.key' "${XCC_NODES}")"
+      ;;
+  esac
+}
+
+#===============================================================================
+# BBR（v2ray-agent 常见系统优化）
+#===============================================================================
+menu_bbr() {
+  local cur
+  cur=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
+  if ! tui_yesno "BBR" "当前拥塞控制: ${cur}\n是否启用 BBR + fq？"; then
+    return 0
+  fi
+  cat > /etc/sysctl.d/99-xcc-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+  sysctl -p /etc/sysctl.d/99-xcc-bbr.conf >/dev/null 2>&1 || sysctl --system >/dev/null 2>&1 || true
+  tui_msg "BBR" "已写入 /etc/sysctl.d/99-xcc-bbr.conf\n当前: $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+}
+
+#===============================================================================
+# Cloudflare WARP 出站（参考 3x-ui / v2ray-agent 分流）
+#===============================================================================
+menu_warp() {
+  local choice arch url tmp cfg priv addr
+  choice=$(tui_menu "WARP 出站" "将 Cloudflare WARP 注册为 Xray wireguard 出站（tag=warp）" \
+    "on" "安装 / 注册 WARP" \
+    "off" "移除 WARP 出站") || return 0
+  begin_config_op
+  case "${choice}" in
+    off)
+      rm -f "${XCC_WARP_FILE}"
+      if apply_xray_config; then end_config_op_ok; tui_msg "完成" "已移除 WARP。"; else end_config_op_fail; fi
+      return
+      ;;
+  esac
+  arch=$(arch_suffix)
+  tmp=$(xcc_mktemp)
+  local wtag
+  wtag=$(github_latest_tag "https://api.github.com/repos/ViRb3/wgcf/releases/latest" || true)
+  wtag="${wtag#v}"
+  [[ -n "${wtag}" ]] || wtag="2.2.22"
+  url="https://github.com/ViRb3/wgcf/releases/download/${wtag}/wgcf_${wtag}_linux_${arch}"
+  info "下载 wgcf ..."
+  if ! xcc_curl "${tmp}" "${url}"; then
+    xcc_curl "${tmp}" "https://ghproxy.net/${url}" || { end_config_op_fail; tui_msg "错误" "下载 wgcf 失败"; return 1; }
+  fi
+  chmod 755 "${tmp}"
+  mkdir -p "${XCC_CACHE_DIR}/wgcf"
+  mv "${tmp}" "${XCC_CACHE_DIR}/wgcf/wgcf"
+  (
+    cd "${XCC_CACHE_DIR}/wgcf"
+    [[ -f wgcf-account.toml ]] || ./wgcf register --accept-tos >/dev/null
+    ./wgcf generate >/dev/null
+  ) || { end_config_op_fail; tui_msg "错误" "wgcf 注册失败"; return 1; }
+  cfg="${XCC_CACHE_DIR}/wgcf/wgcf-profile.conf"
+  priv=$(awk -F' = ' '/^PrivateKey/{print $2}' "${cfg}" | head -n1)
+  addr=$(awk -F' = ' '/^Address/{print $2}' "${cfg}" | head -n1 | cut -d, -f1)
+  jq -n --arg sk "${priv}" --arg addr "${addr}" '{
+      tag:"warp", protocol:"wireguard",
+      settings:{
+        secretKey:$sk,
+        address:[$addr],
+        peers:[{publicKey:"bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=", endpoint:"engage.cloudflareclient.com:2408"}]
+      }
+    }' > "${XCC_WARP_FILE}"
+  chmod 600 "${XCC_WARP_FILE}"
+  if apply_xray_config; then
+    end_config_op_ok
+    tui_msg "完成" "WARP 出站 tag=warp。可在「管理节点」里把出站改为 warp。"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_routing() {
+  local choice cur
+  migrate_nodes_json
+  choice=$(tui_menu "分流规则" "参考 v2ray-agent：BT 阻断 / 广告 / CN 直连 / 域名黑名单" \
+    "bt" "切换 BT/P2P 阻断" \
+    "ads" "切换广告拦截 (geosite:category-ads-all)" \
+    "cn" "切换国内直连 (geoip/geosite:cn)" \
+    "blk" "编辑域名黑名单（逗号分隔）") || return 0
+  begin_config_op
+  case "${choice}" in
+    bt)
+      cur=$(jq -r '.settings.block_bt' "${XCC_NODES}")
+      if [[ "${cur}" == "true" ]]; then set_settings_field block_bt false 1; else set_settings_field block_bt true 1; fi
+      ;;
+    ads)
+      cur=$(jq -r '.settings.block_ads' "${XCC_NODES}")
+      if [[ "${cur}" == "true" ]]; then set_settings_field block_ads false 1; else set_settings_field block_ads true 1; fi
+      ;;
+    cn)
+      cur=$(jq -r '.settings.cn_direct' "${XCC_NODES}")
+      if [[ "${cur}" == "true" ]]; then set_settings_field cn_direct false 1; else set_settings_field cn_direct true 1; fi
+      ;;
+    blk)
+      cur=$(jq -r '.settings.domain_block | join(",")' "${XCC_NODES}")
+      cur=$(tui_input "域名黑名单" "逗号分隔，如 geosite:google,domain:example.com" "${cur}") || { end_config_op_cancel; return 1; }
+      jq --arg s "${cur}" '.settings.domain_block = ($s | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(. != "")))' \
+        "${XCC_NODES}" > "${XCC_NODES}.tmp" && mv "${XCC_NODES}.tmp" "${XCC_NODES}"
+      chmod 600 "${XCC_NODES}"
+      ;;
+  esac
+  if apply_xray_config; then end_config_op_ok; tui_msg "完成" "分流已更新。"; else end_config_op_fail; fi
+}
+
+menu_subscribe() {
+  local url choice
+  choice=$(tui_menu "订阅与分享" "生成全部节点分享链接 / 通用订阅（base64）" \
+    "build" "生成并启动订阅服务" \
+    "show" "显示全部分享链接" \
+    "stop" "停止订阅 HTTP 服务") || return 0
+  case "${choice}" in
+    build)
+      url=$(rebuild_subscribe)
+      tui_msg "订阅地址" "${url}"$'\n\n'"客户端添加此 URL 即可拉取全部节点。"
+      show_share_and_qr "订阅" "${url}"
+      ;;
+    show)
+      collect_all_links > "${XCC_TMP_DIR}/links.txt"
+      tui_textbox_file "分享链接" "${XCC_TMP_DIR}/links.txt"
+      ;;
+    stop)
+      systemctl disable --now xcc-sub >/dev/null 2>&1 || true
+      tui_msg "完成" "订阅服务已停止。"
+      ;;
+  esac
+}
+
+menu_core_update() {
+  local choice
+  choice=$(tui_menu "更新核心" "Xray / Hysteria / xcc 脚本" \
+    "xray" "更新 Xray 到最新 TLS 版本" \
+    "hy" "更新 Hysteria" \
+    "xcc" "更新 xcc 脚本") || return 0
+  case "${choice}" in
+    xray) install_xray; tui_msg "完成" "Xray: $(xray_installed_version)" ;;
+    hy) install_hysteria; tui_msg "完成" "Hysteria: $(hysteria_installed_version)" ;;
+    xcc) cmd_update ;;
+  esac
+}
+
+menu_quick_reality() {
+  local port=443 uuid tag short_id node
+  begin_config_op
+  if ! assert_port_free "${port}"; then
+    port=$(tui_input "一键 Reality" "443 已被占用，请换端口" "8443") || { end_config_op_cancel; return 1; }
+    assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  fi
+  if ! xray_x25519; then
+    tui_msg "错误" "x25519 失败"; end_config_op_fail; return 1
+  fi
+  uuid=$(xray_uuid)
+  tag="reality-${port}"
+  short_id=$(rand_hex 4)
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg uuid "${uuid}" \
+    --arg private_key "${REALITY_PRIV}" --arg public_key "${REALITY_PUB}" --arg short_id "${short_id}" \
+    '{
+      tag:$tag, enabled:true, port:$port, uuid:$uuid,
+      private_key:$private_key, public_key:$public_key,
+      sni:"www.microsoft.com", dest:"www.microsoft.com:443", domain:"www.microsoft.com",
+      flow:"xtls-rprx-vision", fingerprint:"chrome", tls:"1.3", short_id:$short_id, outbound:"proxy"
+    }')
+  upsert_node reality "${node}"
+  fw_allow_tcp "${port}"
+  if apply_xray_config; then
+    end_config_op_ok
+    show_share_and_qr "一键 Reality 完成（无域名 / microsoft 伪装）" "$(reality_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+save_tls_node() {
+  local kind="$1" node="$2" port="$3" udp="${4:-0}"
+  upsert_node "${kind}" "${node}"
+  fw_allow_tcp "${port}"
+  [[ "${udp}" == "1" ]] && fw_allow_udp "${port}"
+  apply_xray_config
+}
+
+menu_config_vless_ws() {
+  local port domain path uuid tag node
+  begin_config_op
+  port=$(tui_input "VLESS-WS-TLS" "端口" "443") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  domain=$(tui_input "VLESS-WS-TLS" "域名 / SNI" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || { end_config_op_cancel; return 1; }
+  path=$(tui_input "VLESS-WS-TLS" "WebSocket 路径" "/xcc") || { end_config_op_cancel; return 1; }
+  prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  uuid=$(xray_uuid)
+  tag="vlessws-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg uuid "${uuid}" \
+    --arg sni "${domain}" --arg host "${domain}" --arg path "${path}" \
+    --arg cert "${CERT_FILE}" --arg key "${KEY_FILE}" \
+    '{tag:$tag,enabled:true,port:$port,uuid:$uuid,sni:$sni,host:$host,path:$path,cert:$cert,key:$key,outbound:"proxy"}')
+  if save_tls_node vless_ws "${node}" "${port}"; then
+    end_config_op_ok
+    show_share_and_qr "VLESS-WS-TLS 已创建" "$(vless_ws_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_vmess() {
+  local port domain path uuid tag node
+  begin_config_op
+  port=$(tui_input "VMess-WS-TLS" "端口" "443") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  domain=$(tui_input "VMess-WS-TLS" "域名 / SNI" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || { end_config_op_cancel; return 1; }
+  path=$(tui_input "VMess-WS-TLS" "WebSocket 路径" "/vmess") || { end_config_op_cancel; return 1; }
+  prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  uuid=$(xray_uuid)
+  tag="vmess-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg uuid "${uuid}" \
+    --arg sni "${domain}" --arg host "${domain}" --arg path "${path}" \
+    --arg cert "${CERT_FILE}" --arg key "${KEY_FILE}" \
+    '{tag:$tag,enabled:true,port:$port,uuid:$uuid,sni:$sni,host:$host,path:$path,network:"ws",cert:$cert,key:$key,outbound:"proxy"}')
+  if save_tls_node vmess "${node}" "${port}"; then
+    end_config_op_ok
+    show_share_and_qr "VMess-WS-TLS 已创建" "$(vmess_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_trojan() {
+  local port domain pass tag node
+  begin_config_op
+  port=$(tui_input "Trojan-TLS" "端口" "443") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  domain=$(tui_input "Trojan-TLS" "域名 / SNI" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || { end_config_op_cancel; return 1; }
+  pass=$(tui_input "Trojan-TLS" "密码" "$(rand_alnum 16)") || { end_config_op_cancel; return 1; }
+  prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  tag="trojan-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg password "${pass}" \
+    --arg sni "${domain}" --arg cert "${CERT_FILE}" --arg key "${KEY_FILE}" \
+    '{tag:$tag,enabled:true,port:$port,password:$password,sni:$sni,network:"tcp",cert:$cert,key:$key,outbound:"proxy"}')
+  if save_tls_node trojan "${node}" "${port}"; then
+    end_config_op_ok
+    show_share_and_qr "Trojan-TLS 已创建" "$(trojan_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_ss() {
+  local port pass tag node
+  begin_config_op
+  port=$(tui_input "Shadowsocks 2022" "端口" "40000") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  pass=$(openssl rand -base64 16 | tr -d '\n')
+  tag="ss-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg password "${pass}" \
+    '{tag:$tag,enabled:true,port:$port,password:$password,method:"2022-blake3-aes-128-gcm",outbound:"proxy"}')
+  upsert_node shadowsocks "${node}"
+  fw_allow_tcp "${port}"
+  fw_allow_udp "${port}"
+  if apply_xray_config; then
+    end_config_op_ok
+    show_share_and_qr "Shadowsocks 2022 已创建" "$(ss_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_manage_generic() {
+  local kind="$1" title="$2" tag json choice port ob
+  tag=$(select_node_tag "${kind}" "${title}") || return 1
+  while true; do
+    json=$(node_json_by_tag "${kind}" "${tag}")
+    [[ -n "${json}" ]] || return 0
+    choice=$(tui_menu "${title}" "$(printf '%s' "${json}" | jq -r '"\(.tag) port=\(.port) \(if .enabled then "启用" else "禁用" end) out=\(.outbound // "proxy")"')" \
+      "toggle" "启用 / 禁用" \
+      "out" "出站（proxy / direct / warp）" \
+      "share" "分享链接 / 二维码" \
+      "del" "删除" \
+      "back" "返回") || return 0
+    case "${choice}" in
+      toggle)
+        begin_config_op
+        if [[ "$(printf '%s' "${json}" | jq -r '.enabled')" == "true" ]]; then
+          set_node_field "${kind}" "${tag}" enabled false 1
+        else
+          set_node_field "${kind}" "${tag}" enabled true 1
+        fi
+        if apply_xray_config; then end_config_op_ok; else end_config_op_fail; fi
+        ;;
+      out)
+        begin_config_op
+        ob=$(tui_menu "出站" "为 ${tag} 选择" "proxy" "Shifter/SOCKS5" "direct" "直连" "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
+        set_node_field "${kind}" "${tag}" outbound "${ob}"
+        if apply_xray_config; then end_config_op_ok; else end_config_op_fail; fi
+        ;;
+      share)
+        show_share_and_qr "${kind}" "$(node_share_link "${kind}" "${json}")"
+        ;;
+      del)
+        begin_config_op
+        if tui_yesno "删除" "确认删除 ${tag}？"; then
+          delete_node "${kind}" "${tag}"
+          if apply_xray_config; then end_config_op_ok; return 0; else end_config_op_fail; fi
+        else
+          end_config_op_cancel
+        fi
+        ;;
+      back|*) return 0 ;;
+    esac
+  done
+}
+
+menu_manage_hub() {
+  local choice
+  choice=$(tui_menu "管理节点" "选择协议" \
+    "reality" "Reality" \
+    "hysteria" "Hysteria2" \
+    "vless_ws" "VLESS-WS-TLS" \
+    "vmess" "VMess-WS-TLS" \
+    "trojan" "Trojan-TLS" \
+    "ss" "Shadowsocks 2022") || return 0
+  case "${choice}" in
+    reality) menu_manage_reality ;;
+    hysteria) menu_manage_hysteria ;;
+    vless_ws) menu_manage_generic vless_ws "管理 VLESS-WS" ;;
+    vmess) menu_manage_generic vmess "管理 VMess" ;;
+    trojan) menu_manage_generic trojan "管理 Trojan" ;;
+    ss) menu_manage_generic shadowsocks "管理 Shadowsocks" ;;
+  esac
+}
+
+menu_outbound_hub() {
+  local choice
+  choice=$(tui_menu "出站与分流" "全局 SOCKS5 / WARP / 路由规则" \
+    "socks" "设置 SOCKS5（Shifter）或直连" \
+    "warp" "Cloudflare WARP" \
+    "route" "分流规则（BT/广告/CN/黑名单）") || return 0
+  case "${choice}" in
+    socks) menu_outbound ;;
+    warp) menu_warp ;;
+    route) menu_routing ;;
+  esac
+}
+
 #===============================================================================
 # 菜单：配置 Reality
 #===============================================================================
@@ -1676,7 +2421,7 @@ select_node_tag() {
   local kind="$1"
   local title="$2"
   local count items=() tag desc
-  count=$(jq -r --arg k "${kind}" '.[$k] | length' "${XCC_NODES}")
+  count=$(jq -r --arg k "${kind}" '(.[$k] // []) | length' "${XCC_NODES}")
   if [[ "${count}" -eq 0 ]]; then
     tui_msg "提示" "尚未配置 ${kind} 节点。"
     return 1
@@ -1803,7 +2548,8 @@ menu_manage_reality() {
         local ob
         ob=$(tui_menu "出站方式" "为 ${tag} 选择出站" \
           "proxy" "Shifter / SOCKS5 默认出站" \
-          "direct" "直连") || { end_config_op_cancel; continue; }
+          "direct" "直连" \
+          "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
         set_node_field reality "${tag}" outbound "${ob}"
         if apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
@@ -1882,7 +2628,8 @@ menu_manage_hysteria() {
         local ob
         ob=$(tui_menu "出站方式" "为 ${tag} 选择出站" \
           "proxy" "Shifter / SOCKS5 默认出站" \
-          "direct" "直连") || { end_config_op_cancel; continue; }
+          "direct" "直连" \
+          "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
         set_node_field hysteria "${tag}" outbound "${ob}"
         if apply_hysteria_config && apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
@@ -2080,6 +2827,8 @@ do_uninstall() {
   also="${1:-ask}"
   systemctl stop xcc-watchdog >/dev/null 2>&1 || true
   systemctl disable xcc-watchdog >/dev/null 2>&1 || true
+  systemctl disable --now xcc-sub >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/xcc-sub.service
   if [[ "${also}" == "ask" ]]; then
     if tui_yesno "卸载组件" "是否同时卸载 Xray 和 Hysteria？"; then
       also="yes"
@@ -2312,25 +3061,43 @@ main_menu() {
     extra=$'\n'"⚠ 看门狗保护已触发，Xray 不会自动重启。可选择重置。"
   fi
   while true; do
-    choice=$(tui_menu "xcc 主菜单" "请选择操作（仅支持单用户配置）${extra}" \
+    choice=$(tui_menu "xcc 主菜单" "v2.0 多协议管理（参考 v2ray-agent / 3x-ui，仍为单机单用户）${extra}" \
+      "d" "状态面板 / 流量" \
+      "q" "一键 Reality（无域名）" \
       "1" "配置 Reality 节点" \
-      "2" "配置 Hysteria 节点" \
-      "3" "管理 Reality 节点" \
-      "4" "管理 Hysteria 节点" \
-      "5" "设置出站代理" \
-      "6" "设置新的 SSH 连接端口" \
+      "2" "配置 Hysteria2 节点" \
+      "v" "配置 VLESS-WS-TLS" \
+      "m" "配置 VMess-WS-TLS" \
+      "t" "配置 Trojan-TLS" \
+      "s" "配置 Shadowsocks 2022" \
+      "3" "管理节点" \
+      "u" "订阅 / 分享链接" \
+      "5" "出站 / WARP / 分流" \
+      "c" "证书（ACME）" \
+      "b" "启用 BBR 加速" \
+      "6" "设置 SSH 端口" \
+      "k" "更新核心（Xray/Hysteria/xcc）" \
       "7" "备份配置" \
       "8" "恢复配置" \
       "9" "卸载 xcc" \
       "r" "重置看门狗保护" \
       "0" "退出") || exit 0
     case "${choice}" in
+      d) menu_dashboard ;;
+      q) menu_quick_reality ;;
       1) menu_config_reality ;;
       2) menu_config_hysteria ;;
-      3) menu_manage_reality ;;
-      4) menu_manage_hysteria ;;
-      5) menu_outbound ;;
+      v) menu_config_vless_ws ;;
+      m) menu_config_vmess ;;
+      t) menu_config_trojan ;;
+      s) menu_config_ss ;;
+      3) menu_manage_hub ;;
+      u) menu_subscribe ;;
+      5) menu_outbound_hub ;;
+      c) menu_certs ;;
+      b) menu_bbr ;;
       6) menu_ssh_port ;;
+      k) menu_core_update ;;
       7) menu_backup ;;
       8) menu_restore ;;
       9) menu_uninstall ;;
@@ -2368,6 +3135,7 @@ xcc ${XCC_VERSION} - Xray / Hysteria 节点管理工具（仅支持单用户配�
 Usage:
   xcc              显示本帮助
   xcc run          启动中文 TUI 管理界面
+  xcc status       显示状态面板
   xcc update       从 GitHub 下载最新脚本覆盖 ${XCC_BIN}（保留 ${XCC_DIR}/）
   xcc uninstall    卸载 xcc（需输入 yes 确认）
   xcc version      显示版本
@@ -2384,6 +3152,7 @@ main() {
   case "${cmd}" in
     ""|-h|--help|help) usage ;;
     run) cmd_run ;;
+    status) need_root; init_tmp; detect_os; ensure_dirs; TUI_BACKEND=cli; menu_dashboard ;;
     update) cmd_update ;;
     uninstall) cmd_uninstall ;;
     version|--version) cmd_version ;;
