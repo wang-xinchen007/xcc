@@ -2,7 +2,7 @@
 #===============================================================================
 #  xcc - Xray / sing-box / Nginx 节点管理工具
 #  Author : xcc
-#  Version: 2.2.2
+#  Version: 2.3.0
 #  Description: 单用户 Xray / sing-box / Nginx 节点管理（中文 TUI）
 #               入站覆盖对齐 3X-UI。目标系统：Ubuntu 24.04+ / Debian 12+ / CentOS 9+
 #===============================================================================
@@ -22,7 +22,7 @@ NC='\033[0m'
 #-------------------------------------------------------------------------------
 # 版本与仓库
 #-------------------------------------------------------------------------------
-XCC_VERSION="2.2.2"
+XCC_VERSION="2.3.0"
 XCC_CONFIG_FORMAT="3"
 XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
 XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
@@ -65,7 +65,13 @@ HYSTERIA_CONF="${SINGBOX_CONF}"
 XCC_CERT_DIR="${XCC_DIR}/certs"
 XCC_SUB_DIR="${XCC_DIR}/subscribe"
 XCC_WARP_FILE="${XCC_DIR}/warp.json"
-XCC_SETTINGS_DEFAULT='{"block_bt":true,"block_ads":false,"cn_direct":false,"domain_block":[],"ipv6_domains":[],"sub_token":"","sub_port":2096,"nginx_port":443,"cert":"","key":"","domain":"","warp":false,"hy_up_mbps":100,"hy_down_mbps":50}'
+XCC_SETTINGS_DEFAULT='{"block_bt":true,"block_ads":false,"cn_direct":false,"domain_block":[],"ipv6_domains":[],"sub_token":"","sub_port":2096,"nginx_port":443,"cert":"","key":"","domain":"","warp":false,"hy_up_mbps":100,"hy_down_mbps":50,"clash_tun":false}'
+TUN_DEFAULT_NAME="xcc0"
+TUN_DEFAULT_MTU=1500
+TUN_DEFAULT_GATEWAY="172.19.0.1/30"
+TUN_DEFAULT_GATEWAY6="fdfe:dcba:9876::1/126"
+XRAY_TUN_DROPIN="/etc/systemd/system/xray.service.d/10-xcc-tun.conf"
+XCC_TUN_SYSCTL="/etc/sysctl.d/99-xcc-tun.conf"
 # 与 v2ray-agent 重合的 Reality / Hysteria2 默认值（分享链接、shortId、伪装站必须一致）
 REALITY_DEFAULT_SID="6ba85179e30d4fc2"
 REALITY_DEFAULT_SNI="download-installer.cdn.mozilla.net"
@@ -815,7 +821,7 @@ ensure_dirs() {
     "$(dirname "${XRAY_CONF}")" "${XCC_TMP_DIR}" "${XCC_CACHE_DIR}"
   chmod 700 "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${SINGBOX_DIR}" "${XCC_CERT_DIR}"
   if [[ ! -f "${XCC_NODES}" ]]; then
-    printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vless":[],"vmess":[],"trojan":[],"shadowsocks":[],"wireguard":[],"http":[],"socks":[],"tunnel":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${XCC_NODES}"
+    printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vless":[],"vmess":[],"trojan":[],"shadowsocks":[],"wireguard":[],"http":[],"socks":[],"tunnel":[],"tun":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${XCC_NODES}"
     chmod 600 "${XCC_NODES}"
   else
     migrate_nodes_json
@@ -844,6 +850,7 @@ migrate_nodes_json() {
       | .http //= []
       | .socks //= []
       | .tunnel //= []
+      | .tun //= []
       | .settings = ($st + (.settings // {}))
       | .settings.ipv6_domains //= []
       | .reality = [
@@ -877,6 +884,15 @@ migrate_nodes_json() {
       | .http = [ .http[] | .email = (.email // .tag // "xcc") ]
       | .socks = [ .socks[] | .email = (.email // .tag // "xcc") ]
       | .tunnel = [ .tunnel[] | .email = (.email // .tag // "xcc") ]
+      | .tun = [
+          .tun[]
+          | .email = (.email // .tag // "xcc")
+          | .name = (.name // "xcc0")
+          | .mtu = (.mtu // 1500)
+          | .auto_route = (.auto_route // "off")
+          | .auto_iface = (.auto_iface // "auto")
+          | .private_direct = (.private_direct // true)
+        ]
     ' 2>/dev/null || true
 }
 
@@ -2226,6 +2242,47 @@ build_xray_config_json() {
         },
         sniffing: sniff
       };
+    def tun_gateway:
+      (
+        if ((.gateway // null) | type) == "array" and ((.gateway)|length) > 0 then .gateway
+        elif ((.gateway // "") | type) == "string" and (.gateway // "") != "" then [(.gateway)]
+        else ["172.19.0.1/30"] end
+      )
+      + (if .ipv6 == true then
+           if ((.gateway6 // "") != "") then [(.gateway6)] else ["fdfe:dcba:9876::1/126"] end
+         else [] end);
+    def tun_dns:
+      if ((.dns // null) | type) == "array" and ((.dns)|length) > 0 then .dns
+      elif ((.dns // "") | type) == "string" and (.dns // "") != "" then [(.dns)]
+      else ["1.1.1.1","8.8.8.8"] end;
+    def tun_routes:
+      if (.auto_route // "off") == "both" then ["0.0.0.0/0","::/0"]
+      elif (.auto_route // "off") == "ipv4" then ["0.0.0.0/0"]
+      elif (.auto_route // "off") == "ipv6" then ["::/0"]
+      elif ((.auto_system_routing // null) | type) == "array" and ((.auto_system_routing)|length) > 0 then .auto_system_routing
+      else [] end;
+    def tun_inbound:
+      {
+        tag: .tag,
+        protocol: "tun",
+        settings: (
+          {
+            name: (.name // "xcc0"),
+            mtu: ((.mtu // 1500) | tonumber),
+            gateway: tun_gateway,
+            dns: tun_dns,
+            userLevel: 0,
+            autoOutboundsInterface: (if (.auto_iface // "") == "" then "auto" else .auto_iface end)
+          }
+          + (if (tun_routes|length) > 0 then {autoSystemRoutingTable: tun_routes} else {} end)
+        ),
+        sniffing: sniff
+      };
+    def tun_private_ips:
+      ["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"]
+      + (if .ipv6 == true then ["fc00::/7","fe80::/10"] else [] end);
+    def tun_private_rule:
+      {type:"field", inboundTag:[.tag], ip: tun_private_ips, outboundTag:"direct"};
     def resolve_ob($node):
       ($node.outbound // $default_tag) as $o
       | if $o == "warp" and ($warp == null) then $default_tag
@@ -2267,6 +2324,7 @@ build_xray_config_json() {
         + [ $nodes.http[]?        | select(.enabled == true) | http_inbound ]
         + [ $nodes.socks[]?       | select(.enabled == true) | socks_inbound ]
         + [ $nodes.tunnel[]?      | select(.enabled == true) | tunnel_inbound ]
+        + [ $nodes.tun[]?         | select(.enabled == true) | tun_inbound ]
       ),
       outbounds: (
         [ (if $default_tag == "proxy" then $proxy else freedom_plain("direct") end),
@@ -2298,6 +2356,8 @@ build_xray_config_json() {
           + [ $nodes.http[]?         | select(.enabled == true) | node_rule ]
           + [ $nodes.socks[]?        | select(.enabled == true) | node_rule ]
           + [ $nodes.tunnel[]?       | select(.enabled == true) | node_rule ]
+          + [ $nodes.tun[]?          | select(.enabled == true and (.private_direct // true) != false) | tun_private_rule ]
+          + [ $nodes.tun[]?          | select(.enabled == true) | node_rule ]
           + (if ($st.cn_direct // false) and $has_geo then [
                {type:"field", domain:["geosite:cn"], outboundTag:"direct"},
                {type:"field", ip:["geoip:cn"], outboundTag:"direct"}
@@ -2314,6 +2374,35 @@ build_xray_config_json() {
   return 0
 }
 
+tun_nodes_enabled() {
+  [[ -f "${XCC_NODES}" ]] || return 1
+  jq -e '[.tun[]? | select(.enabled == true)] | length > 0' "${XCC_NODES}" >/dev/null 2>&1
+}
+
+tun_device_available() {
+  [[ -c /dev/net/tun ]] || [[ -c /dev/tun ]]
+}
+
+ensure_xray_tun_caps() {
+  mkdir -p "$(dirname "${XRAY_TUN_DROPIN}")"
+  cat > "${XRAY_TUN_DROPIN}" <<'EOF'
+[Service]
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+DeviceAllow=/dev/net/tun rw
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
+ensure_tun_sysctl() {
+  mkdir -p "$(dirname "${XCC_TUN_SYSCTL}")"
+  cat > "${XCC_TUN_SYSCTL}" <<'EOF'
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 1
+EOF
+  sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1 || true
+}
+
 # 根据 nodes.json + outbound.conf 重建 Xray 配置。
 # 路由：API → BT/广告/域名黑名单 → gstatic 直连 → Reality dokodemo 直连 → 各入站独立出站 → CN 直连。
 apply_xray_config() {
@@ -2324,6 +2413,10 @@ apply_xray_config() {
   if ! build_xray_config_json "${tmp}"; then
     rm -f "${tmp}"
     return 1
+  fi
+  if tun_nodes_enabled; then
+    ensure_xray_tun_caps
+    ensure_tun_sysctl
   fi
 
   if [[ -x "${XRAY_BIN}" ]] && ! xray_test_config "${tmp}"; then
@@ -2814,6 +2907,17 @@ tunnel_share_link() {
   printf '%s\n' "${json}" | jq -r '"dokodemo-door \(.port) -> \(.target_address):\(.target_port) (\(.network // "tcp,udp"))"'
 }
 
+tun_share_link() {
+  local json="$1"
+  printf '%s\n' "${json}" | jq -r '
+    "TUN if=\(.name // "xcc0") gw=\((.gateway // ["172.19.0.1/30"]) | if type=="array" then join(",") else . end)"
+    + (if .ipv6 == true then " gw6=\(.gateway6 // "fdfe:dcba:9876::1/126")" else "" end)
+    + " mtu=\(.mtu // 1500) auto_route=\(.auto_route // "off") out=\(.outbound // "proxy")"
+    + "\n本机虚拟网卡，不是远程分享链接。其它机器把默认路由指到本机或写入 TUN 网关即可。"
+    + (if (.auto_route // "off") == "off" then "\n当前未写系统默认路由，需自行 ip route / 策略路由。" else "\n已自动写入系统路由表（autoOutboundsInterface=auto 防回环）。" end)
+  '
+}
+
 node_share_link() {
   local kind="$1" json="$2"
   case "${kind}" in
@@ -2828,13 +2932,14 @@ node_share_link() {
     http) http_share_link "${json}" ;;
     socks) socks_share_link "${json}" ;;
     tunnel) tunnel_share_link "${json}" ;;
+    tun) tun_share_link "${json}" ;;
   esac
 }
 
 collect_all_links() {
   local kind json
   migrate_nodes_json
-  for kind in reality vless_ws vless vmess trojan shadowsocks hysteria wireguard http socks tunnel; do
+  for kind in reality vless_ws vless vmess trojan shadowsocks hysteria wireguard http socks tunnel tun; do
     while IFS= read -r json; do
       [[ -n "${json}" ]] || continue
       node_share_link "${kind}" "${json}"
@@ -3211,7 +3316,7 @@ write_clash_proxies() {
 
 write_clash_subscribe() {
   local dest="$1"
-  local proxies names_file name_yaml="" n
+  local proxies names_file name_yaml="" n tun_yaml=""
   proxies=$(xcc_mktemp)
   names_file=$(xcc_mktemp)
   write_clash_proxies "${proxies}" "${names_file}"
@@ -3221,6 +3326,9 @@ write_clash_subscribe() {
   done < "${names_file}"
   if [[ -z "${name_yaml}" ]]; then
     name_yaml='      - DIRECT'$'\n'
+  fi
+  if [[ "$(jq -r '.settings.clash_tun // false' "${XCC_NODES}" 2>/dev/null)" == "true" ]]; then
+    tun_yaml=$'tun:\n  enable: true\n  stack: system\n  auto-route: true\n  auto-detect-interface: true\n  strict-route: true\n  dns-hijack:\n    - any:53\n'
   fi
   cat > "${dest}" <<EOF
 mixed-port: 7890
@@ -3232,7 +3340,7 @@ find-process-mode: strict
 unified-delay: true
 tcp-concurrent: true
 ipv6: true
-external-controller: 127.0.0.1:9090
+${tun_yaml}external-controller: 127.0.0.1:9090
 profile:
   store-selected: true
 sniffer:
@@ -3344,9 +3452,9 @@ menu_dashboard() {
     echo "----- 节点 -----"
     jq -r '
       def line($k):
-        (.[$k][]? | "  \($k)\t\(.tag)\tport=\(.port)\t\(if .enabled then "启用" else "禁用" end)\tout=\(.outbound // "proxy")");
+        (.[$k][]? | "  \($k)\t\(.tag)\t\(if .port then "port=\(.port)" else "if=\(.name // "-")" end)\t\(if .enabled then "启用" else "禁用" end)\tout=\(.outbound // "proxy")");
       line("reality"), line("vless_ws"), line("vless"), line("vmess"), line("trojan"), line("shadowsocks"),
-      line("hysteria"), line("wireguard"), line("http"), line("socks"), line("tunnel")
+      line("hysteria"), line("wireguard"), line("http"), line("socks"), line("tunnel"), line("tun")
     ' "${XCC_NODES}" 2>/dev/null || true
     echo
     echo "----- 流量 (Xray Stats API) -----"
@@ -3585,6 +3693,7 @@ menu_subscribe() {
   choice=$(tui_menu "订阅与分享" "生成全部节点分享链接 / 通用订阅（Nginx 提供）" \
     "build" "生成订阅（Nginx /s/TOKEN）" \
     "show" "显示全部分享链接" \
+    "clash_tun" "Clash 订阅客户端 TUN（本机全局）" \
     "stop" "说明：订阅由 Nginx 提供") || return 0
   case "${choice}" in
     build)
@@ -3596,6 +3705,27 @@ menu_subscribe() {
     show)
       collect_all_links > "${XCC_TMP_DIR}/links.txt"
       tui_textbox_file "分享链接" "${XCC_TMP_DIR}/links.txt"
+      ;;
+    clash_tun)
+      begin_config_op
+      if [[ "$(jq -r '.settings.clash_tun // false' "${XCC_NODES}")" == "true" ]]; then
+        if tui_yesno "Clash TUN" "当前已开启。是否关闭客户端 TUN？"; then
+          set_settings_field clash_tun false 1
+        else
+          end_config_op_cancel
+          return 0
+        fi
+      else
+        if tui_yesno "Clash TUN" "写入 Clash Meta 订阅的 tun.enable=true（客户端本机全局代理，与服务器 TUN 入站无关）。是否开启？"; then
+          set_settings_field clash_tun true 1
+        else
+          end_config_op_cancel
+          return 0
+        fi
+      fi
+      write_subscribe_files || true
+      end_config_op_ok
+      tui_msg "完成" "Clash TUN: $(jq -r '.settings.clash_tun // false' "${XCC_NODES}")"
       ;;
     stop)
       tui_msg "完成" "订阅由 Nginx 提供。停用请删除 TLS 节点或卸载 xcc。"
@@ -3762,14 +3892,15 @@ menu_config_ss() {
 
 menu_more_protocols() {
   local choice
-  choice=$(tui_menu "更多协议（3X-UI 覆盖）" "VLESS/VMess/Trojan 全传输 + WG / HTTP / SOCKS / Tunnel" \
+  choice=$(tui_menu "更多协议（3X-UI 覆盖）" "VLESS/VMess/Trojan 全传输 + WG / HTTP / SOCKS / Tunnel / TUN" \
     "vless" "VLESS（TCP/gRPC/XHTTP/HTTPUpgrade/mKCP）" \
     "vmess" "VMess（全传输）" \
     "trojan" "Trojan（全传输 / REALITY）" \
     "wg" "WireGuard 入站" \
     "http" "HTTP 入站" \
     "socks" "SOCKS5 / Mixed 入站" \
-    "tunnel" "Tunnel（dokodemo-door）") || return 0
+    "tunnel" "Tunnel（dokodemo-door）" \
+    "tun" "TUN（本机虚拟网卡 / 透明代理）") || return 0
   case "${choice}" in
     vless) menu_config_vless_full ;;
     vmess) menu_config_vmess_full ;;
@@ -3778,6 +3909,7 @@ menu_more_protocols() {
     http) menu_config_http ;;
     socks) menu_config_socks ;;
     tunnel) menu_config_tunnel ;;
+    tun) menu_config_tun ;;
   esac
 }
 
@@ -4030,13 +4162,147 @@ menu_config_tunnel() {
   fi
 }
 
+menu_config_tun() {
+  local name gw gw6 mtu auto_route ipv6 tag node exist n
+  begin_config_op
+  if ! tun_device_available; then
+    tui_msg "错误" "本机没有 /dev/net/tun。OpenVZ / 部分 LXC 需先在宿主机打开 TUN。"
+    end_config_op_cancel
+    return 1
+  fi
+  n=$(jq '[.tun[]?] | length' "${XCC_NODES}" 2>/dev/null || echo 0)
+  if [[ "${n}" =~ ^[0-9]+$ && "${n}" -gt 0 ]]; then
+    if ! tui_yesno "已有 TUN" "通常只需一个 TUN 接口。是否再添加？"; then
+      end_config_op_cancel
+      return 1
+    fi
+  fi
+  name=$(tui_input "TUN" "接口名（Linux 最长 15 字符）" "${TUN_DEFAULT_NAME}") || { end_config_op_cancel; return 1; }
+  if ! [[ "${name}" =~ ^[A-Za-z][A-Za-z0-9_-]{0,14}$ ]]; then
+    tui_msg "错误" "接口名无效：需字母开头，仅字母数字 _ -，最长 15。"
+    end_config_op_cancel
+    return 1
+  fi
+  exist=$(jq -r --arg n "${name}" '[.tun[]? | select(.name==$n)] | length' "${XCC_NODES}" 2>/dev/null || echo 0)
+  if [[ "${exist}" =~ ^[0-9]+$ && "${exist}" -gt 0 ]]; then
+    tui_msg "错误" "接口名 ${name} 已被其它 TUN 节点占用。"
+    end_config_op_cancel
+    return 1
+  fi
+  gw=$(tui_input "TUN" "接口 IPv4 网关（CIDR）" "${TUN_DEFAULT_GATEWAY}") || { end_config_op_cancel; return 1; }
+  if ! [[ "${gw}" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+    tui_msg "错误" "IPv4 网关需写成 CIDR，例如 ${TUN_DEFAULT_GATEWAY}"
+    end_config_op_cancel
+    return 1
+  fi
+  ipv6=false
+  gw6=""
+  if tui_yesno "TUN IPv6" "是否同时配置 IPv6 网关？" 1; then
+    ipv6=true
+    gw6=$(tui_input "TUN" "接口 IPv6 网关（CIDR）" "${TUN_DEFAULT_GATEWAY6}") || { end_config_op_cancel; return 1; }
+  fi
+  mtu=$(tui_input "TUN" "MTU" "${TUN_DEFAULT_MTU}") || { end_config_op_cancel; return 1; }
+  if ! [[ "${mtu}" =~ ^[0-9]+$ ]]; then
+    tui_msg "错误" "MTU 无效"
+    end_config_op_cancel
+    return 1
+  fi
+  auto_route=$(tui_menu "TUN 系统路由" "对齐 3X-UI autoSystemRoutingTable。默认只建接口，不劫持本机默认路由。" \
+    "off" "仅建接口（其它机器策略路由进来）" \
+    "ipv4" "本机 IPv4 全局透明代理（0.0.0.0/0）" \
+    "both" "本机 IPv4+IPv6 全局透明代理") || { end_config_op_cancel; return 1; }
+  if [[ "${auto_route}" != "off" ]]; then
+    if ! tui_yesno "TUN 警告" "会把默认路由写入系统。出站失败时 SSH 可能断连。已设 autoOutboundsInterface=auto 防 Xray 回环，私网默认走 direct。确定继续？"; then
+      end_config_op_cancel
+      return 1
+    fi
+  fi
+  tag="tun-${name}"
+  node=$(jq -n --arg tag "${tag}" --arg name "${name}" --argjson mtu "${mtu}" \
+    --arg gw "${gw}" --arg gw6 "${gw6}" --argjson ipv6 "${ipv6}" --arg auto_route "${auto_route}" \
+    '{
+      tag:$tag, enabled:true, email:$tag, outbound:"proxy",
+      name:$name, mtu:$mtu, gateway:[$gw], gateway6:$gw6, ipv6:$ipv6,
+      dns:["1.1.1.1","8.8.8.8"],
+      auto_route:$auto_route, auto_iface:"auto", private_direct:true
+    }')
+  upsert_node tun "${node}"
+  if apply_xray_config; then
+    end_config_op_ok
+    tui_msg "TUN 已创建" "$(tun_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_manage_tun() {
+  local tag json choice ob auto_route
+  tag=$(select_node_tag tun "管理 TUN") || return 1
+  while true; do
+    json=$(node_json_by_tag tun "${tag}")
+    [[ -n "${json}" ]] || return 0
+    choice=$(tui_menu "管理 TUN" "$(printf '%s' "${json}" | jq -r '"\(.tag) if=\(.name // "xcc0") \(if .enabled then "启用" else "禁用" end) route=\(.auto_route // "off") out=\(.outbound // "proxy")"')" \
+      "toggle" "启用 / 禁用" \
+      "out" "出站（proxy / direct / warp）" \
+      "route" "系统路由（off / ipv4 / both）" \
+      "share" "接口说明" \
+      "del" "删除" \
+      "back" "返回") || return 0
+    case "${choice}" in
+      toggle)
+        begin_config_op
+        if [[ "$(printf '%s' "${json}" | jq -r '.enabled')" == "true" ]]; then
+          set_node_field tun "${tag}" enabled false 1
+        else
+          set_node_field tun "${tag}" enabled true 1
+        fi
+        if apply_xray_config; then end_config_op_ok; else end_config_op_fail; fi
+        ;;
+      out)
+        begin_config_op
+        ob=$(prompt_node_outbound "出站 ${tag}") || { end_config_op_cancel; continue; }
+        set_node_field tun "${tag}" outbound "${ob}"
+        if apply_xray_config; then end_config_op_ok; else end_config_op_fail; fi
+        ;;
+      route)
+        begin_config_op
+        auto_route=$(tui_menu "TUN 系统路由" "修改 autoSystemRoutingTable" \
+          "off" "仅建接口" \
+          "ipv4" "本机 IPv4 全局" \
+          "both" "本机 IPv4+IPv6 全局") || { end_config_op_cancel; continue; }
+        if [[ "${auto_route}" != "off" ]]; then
+          if ! tui_yesno "TUN 警告" "会劫持本机默认路由，出站失败时 SSH 可能断连。确定？"; then
+            end_config_op_cancel
+            continue
+          fi
+        fi
+        set_node_field tun "${tag}" auto_route "${auto_route}"
+        if apply_xray_config; then end_config_op_ok; else end_config_op_fail; fi
+        ;;
+      share)
+        tui_msg "TUN" "$(tun_share_link "${json}")"
+        ;;
+      del)
+        begin_config_op
+        if tui_yesno "删除" "确认删除 ${tag}？"; then
+          delete_node tun "${tag}"
+          if apply_xray_config; then end_config_op_ok; return 0; else end_config_op_fail; fi
+        else
+          end_config_op_cancel
+        fi
+        ;;
+      back|*) return 0 ;;
+    esac
+  done
+}
+
 menu_manage_generic() {
   local kind="$1" title="$2" tag json choice port ob
   tag=$(select_node_tag "${kind}" "${title}") || return 1
   while true; do
     json=$(node_json_by_tag "${kind}" "${tag}")
     [[ -n "${json}" ]] || return 0
-    choice=$(tui_menu "${title}" "$(printf '%s' "${json}" | jq -r '"\(.tag) port=\(.port) \(if .enabled then "启用" else "禁用" end) out=\(.outbound // "proxy")"')" \
+    choice=$(tui_menu "${title}" "$(printf '%s' "${json}" | jq -r '"\(.tag) \(if .port then "port=\(.port) " else "if=\(.name // "tun") " end)\(if .enabled then "启用" else "禁用" end) out=\(.outbound // "proxy")"')" \
       "toggle" "启用 / 禁用" \
       "out" "出站（proxy / direct / warp）" \
       "share" "分享链接 / 二维码" \
@@ -4088,7 +4354,8 @@ menu_manage_hub() {
     "wg" "WireGuard" \
     "http" "HTTP 入站" \
     "socks" "SOCKS5 入站" \
-    "tunnel" "Tunnel") || return 0
+    "tunnel" "Tunnel" \
+    "tun" "TUN") || return 0
   case "${choice}" in
     reality) menu_manage_reality ;;
     hysteria) menu_manage_hysteria ;;
@@ -4101,6 +4368,7 @@ menu_manage_hub() {
     http) menu_manage_generic http "管理 HTTP" ;;
     socks) menu_manage_generic socks "管理 SOCKS" ;;
     tunnel) menu_manage_generic tunnel "管理 Tunnel" ;;
+    tun) menu_manage_tun ;;
   esac
 }
 
@@ -4281,7 +4549,14 @@ select_node_tag() {
   while IFS=$'\t' read -r tag desc; do
     items+=("${tag}" "${desc}")
   done < <(jq -r --arg k "${kind}" '
-    .[$k][] | [.tag, ((if .enabled then "启用" else "禁用" end) + " port=" + (.port|tostring) + " outbound=" + (.outbound // "proxy"))] | @tsv
+    .[$k][] | [
+      .tag,
+      (
+        (if .enabled then "启用" else "禁用" end)
+        + (if .port then " port=" + (.port|tostring) else " if=" + (.name // .tag) end)
+        + " outbound=" + (.outbound // "proxy")
+      )
+    ] | @tsv
   ' "${XCC_NODES}")
   tui_menu "${title}" "请选择节点" "${items[@]}"
 }
@@ -4686,7 +4961,8 @@ do_uninstall() {
     fi
     rm -rf /etc/hysteria
   fi
-  rm -f "${WATCHDOG_UNIT}" "${SINGBOX_UNIT}" "${LOGROTATE_CONF}"
+  rm -f "${WATCHDOG_UNIT}" "${SINGBOX_UNIT}" "${LOGROTATE_CONF}" "${XRAY_TUN_DROPIN}" "${XCC_TUN_SYSCTL}"
+  rmdir /etc/systemd/system/xray.service.d 2>/dev/null || true
   systemctl daemon-reload || true
   rm -rf "${XCC_DIR}" "${XCC_TMP_DIR}"
   rm -f "${XCC_BIN}"
@@ -4767,7 +5043,7 @@ xray_nodes_enabled() {
   [[ -f "${XCC_NODES}" ]] || return 1
   jq -e '[
     (.reality[]?, .vless_ws[]?, .vless[]?, .vmess[]?, .trojan[]?,
-     .shadowsocks[]?, .wireguard[]?, .http[]?, .socks[]?, .tunnel[]?)
+     .shadowsocks[]?, .wireguard[]?, .http[]?, .socks[]?, .tunnel[]?, .tun[]?)
     | select(.enabled == true)
   ] | length > 0' "${XCC_NODES}" >/dev/null 2>&1
 }
@@ -4994,6 +5270,20 @@ watchdog_missing_udp_ports() {
   return "${miss}"
 }
 
+watchdog_missing_tun_ifaces() {
+  local name miss=0
+  [[ -f "${XCC_NODES}" ]] || return 0
+  command -v ip >/dev/null 2>&1 || return 0
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    if ! ip -o link show "${name}" >/dev/null 2>&1; then
+      xcc_log WARN "TUN 接口 ${name} 不存在"
+      miss=1
+    fi
+  done < <(jq -r '.tun[]? | select(.enabled==true) | .name // "xcc0"' "${XCC_NODES}" 2>/dev/null)
+  return "${miss}"
+}
+
 watchdog_xray_api_ok() {
   [[ -x "${XRAY_BIN}" ]] || return 0
   if timeout 4 "${XRAY_BIN}" api statssys --server="${XRAY_API_ADDR}" >/dev/null 2>&1 \
@@ -5049,6 +5339,9 @@ watchdog_check_xray() {
     xcc_log WARN "Xray 服务未运行"
   else
     if ! xray_expected_tcp_ports | watchdog_missing_tcp_ports; then
+      unhealthy=1
+    fi
+    if ! watchdog_missing_tun_ifaces; then
       unhealthy=1
     fi
     if ! watchdog_xray_api_ok; then
@@ -5358,7 +5651,7 @@ main_menu() {
     extra+=$'\n'"⚠ SOCKS5 已临时切直连，恢复后会自动切回。"
   fi
   while true; do
-    choice=$(tui_menu "xcc 主菜单" "v2.2 协议覆盖对齐 3X-UI（单机单用户）${extra}" \
+    choice=$(tui_menu "xcc 主菜单" "v2.3 协议覆盖对齐 3X-UI（单机单用户）${extra}" \
       "d" "状态面板 / 流量" \
       "q" "一键 Reality（无域名）" \
       "1" "配置 Reality 节点" \
@@ -5367,7 +5660,7 @@ main_menu() {
       "m" "配置 VMess-WS-TLS" \
       "t" "配置 Trojan-TLS" \
       "s" "配置 Shadowsocks" \
-      "p" "更多协议（gRPC/XHTTP/WG/HTTP/SOCKS/Tunnel）" \
+      "p" "更多协议（gRPC/XHTTP/WG/HTTP/SOCKS/Tunnel/TUN）" \
       "3" "管理节点" \
       "u" "订阅 / 分享链接" \
       "5" "出站 / WARP / 分流" \
@@ -5451,10 +5744,16 @@ cmd_selftest() {
     "method": "2022-blake3-aes-128-gcm", "password": "sspass", "outbound": "direct"
   }],
   "wireguard": [], "http": [], "socks": [], "tunnel": [],
+  "tun": [{
+    "tag": "tun-xcc0", "enabled": true, "email": "tun-xcc0",
+    "name": "xcc0", "mtu": 1500, "gateway": ["172.19.0.1/30"],
+    "dns": ["1.1.1.1", "8.8.8.8"], "auto_route": "ipv4",
+    "auto_iface": "auto", "outbound": "proxy", "private_direct": true
+  }],
   "settings": {
     "block_bt": true, "block_ads": false, "cn_direct": false,
     "domain_block": [], "ipv6_domains": ["domain:ipv6.example"],
-    "sub_token": "", "nginx_port": 443
+    "sub_token": "", "nginx_port": 443, "clash_tun": true
   }
 }
 JSON
@@ -5512,7 +5811,28 @@ JSON
     and (.routing.rules[] | select(.domain==["domain:gstatic.com","domain:googleapis.com","domain:googleapis.cn"] and .outboundTag=="z_direct_outbound"))
     and (.routing.rules[] | select(.domain==["domain:ipv6.example"] and .outboundTag=="IPv6_out"))
     and (.routing.rules[] | select(.protocol==["bittorrent"] and .outboundTag=="blackhole_out"))
+    and (.routing.rules[] | select(.inboundTag==["tun-xcc0"] and .outboundTag=="direct" and .ip==["127.0.0.0/8","10.0.0.0/8","172.16.0.0/12","192.168.0.0/16","169.254.0.0/16"]))
+    and (.routing.rules[] | select(.inboundTag==["tun-xcc0"] and .outboundTag=="proxy" and (.ip|not)))
   ' "${out}" >/dev/null || { err "路由规则不完整"; fail=1; }
+
+  jq -e '
+    (.inbounds[] | select(.tag=="tun-xcc0")
+      | .protocol=="tun"
+        and (.listen|not)
+        and (.port|not)
+        and .settings.name=="xcc0"
+        and .settings.mtu==1500
+        and .settings.gateway==["172.19.0.1/30"]
+        and .settings.dns==["1.1.1.1","8.8.8.8"]
+        and .settings.autoSystemRoutingTable==["0.0.0.0/0"]
+        and .settings.autoOutboundsInterface=="auto"
+        and .sniffing.routeOnly==true)
+  ' "${out}" >/dev/null || { err "TUN 入站与 3X-UI / Xray 文档不一致"; fail=1; }
+
+  node=$(jq -c '.tun[0]' "${XCC_NODES}")
+  link=$(tun_share_link "${node}")
+  printf '%s\n' "${link}" | grep -q 'if=xcc0' || { err "TUN 说明缺少接口名: ${link}"; fail=1; }
+  printf '%s\n' "${link}" | grep -q 'auto_route=ipv4' || { err "TUN 说明缺少 auto_route: ${link}"; fail=1; }
 
   printf 'SOCKS5://user:pass@10.0.0.2:1080\n' > "${XCC_OUTBOUND}"
   out="${work}/xray-socks.json"
@@ -5539,6 +5859,10 @@ JSON
   grep -q 'reality-opts:' "${work}/clash.yml" || { err "Clash 缺少 reality-opts"; fail=1; }
   grep -q 'short-id: 6ba85179e30d4fc2' "${work}/clash.yml" || { err "Clash sid 与 v2ray-agent 不一致"; fail=1; }
   grep -q 'flow: xtls-rprx-vision' "${work}/clash.yml" || { err "Clash 缺少 vision flow"; fail=1; }
+
+  write_clash_subscribe "${work}/clash.full.yml"
+  grep -A8 '^tun:' "${work}/clash.full.yml" | grep -q 'enable: true' || { err "Clash 未写入客户端 TUN"; fail=1; }
+  grep -A8 '^tun:' "${work}/clash.full.yml" | grep -q 'auto-route: true' || { err "Clash TUN 缺少 auto-route"; fail=1; }
 
   xray_nodes_enabled || { err "fixture 应判定为有 Xray 节点"; fail=1; }
   ports=$(xray_expected_tcp_ports | sort -u | tr '\n' ' ')
@@ -5567,7 +5891,7 @@ JSON
     fail=1
   fi
 
-  printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vless":[],"vmess":[],"trojan":[],"shadowsocks":[],"wireguard":[],"http":[],"socks":[],"tunnel":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${work}/empty.json"
+  printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vless":[],"vmess":[],"trojan":[],"shadowsocks":[],"wireguard":[],"http":[],"socks":[],"tunnel":[],"tun":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${work}/empty.json"
   cp "${work}/empty.json" "${XCC_NODES}"
   printf 'DIRECT\n' > "${XCC_OUTBOUND}"
   if ! build_xray_config_json "${work}/xray-empty.json"; then
@@ -5584,15 +5908,15 @@ JSON
     "${XCC_NODES}" > "${work}/old.json"
   cp "${work}/old.json" "${XCC_NODES}"
   migrate_nodes_json
-  jq -e '.reality[0].xray_port==45987 and .reality[1].xray_port==45986 and .reality[1].short_id=="6ba85179e30d4fc2"' \
-    "${XCC_NODES}" >/dev/null || { err "migrate 未补齐 Reality xray_port / shortId"; fail=1; }
+  jq -e '.reality[0].xray_port==45987 and .reality[1].xray_port==45986 and .reality[1].short_id=="6ba85179e30d4fc2" and (.tun|type)=="array"' \
+    "${XCC_NODES}" >/dev/null || { err "migrate 未补齐 Reality xray_port / shortId / tun"; fail=1; }
 
   rm -rf "${work}"
   if [[ "${fail}" -ne 0 ]]; then
     err "xcc selftest 失败"
     return 1
   fi
-  info "xcc selftest 通过（Reality 双层入站 / 出站条目 / 路由 / 分享链接 / 迁移）"
+  info "xcc selftest 通过（Reality 双层入站 / TUN / 出站条目 / 路由 / 分享链接 / 迁移）"
   return 0
 }
 
@@ -5625,7 +5949,7 @@ Usage:
   xcc uninstall    卸载 xcc（需输入 yes 确认）
   xcc version      显示版本
   xcc watchdog     看门狗（由 systemd 调用，请勿手动前台运行）
-  xcc selftest     离线自检（Reality / 出站 / 路由 / 分享链接）
+  xcc selftest     离线自检（Reality / TUN / 出站 / 路由 / 分享链接）
 
 安装（国内建议用 jsDelivr，避免 raw.githubusercontent.com DNS 污染）:
   bash <(curl -fsSL https://cdn.jsdelivr.net/gh/${XCC_GITHUB_SLUG}@${XCC_GITHUB_BRANCH}/install.sh)
