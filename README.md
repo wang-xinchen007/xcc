@@ -2,20 +2,25 @@
 
 Xray / **sing-box** / **Nginx** 多协议节点管理工具（**单机单用户**）。TUI 参考 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 的菜单流，能力参考 [3x-ui](https://github.com/MHSanaei/3x-ui) 的入站 / 流量 / 订阅 / 分流，全部收敛在一个 Bash 脚本里。
 
-目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+。依赖 systemd。当前版本 **2.1.0**。
+目标系统：**Ubuntu 24.04+**（主要）、Debian 12+、CentOS 9+。依赖 systemd。当前版本 **2.2.2**。
 
 ## 功能介绍
 
 - 状态面板：CPU / 内存 / 磁盘 / 负载 / 公网 IP / Xray、sing-box、Nginx 状态 / Xray Stats 流量
-- 一键无域名 Reality（默认 `download-installer.cdn.mozilla.net` 伪装，与 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 相同 `sid=6ba85179e30d4fc2` / `fp=chrome` / `flow=xtls-rprx-vision`）
-- 协议：VLESS Reality、VLESS-WS-TLS、VMess-WS-TLS、Trojan-TLS、Shadowsocks 2022、Hysteria2（**SagerNet sing-box**，与 v2ray-agent 相同 inbound）
+- 一键无域名 Reality：与 [v2ray-agent](https://github.com/mack-a/v2ray-agent) 相同的双层入站（公网 `dokodemo-door` → `127.0.0.1:45987` Vision）、`sid=6ba85179e30d4fc2` / `fp=chrome` / `flow=xtls-rprx-vision` / mozilla 伪装
+- 协议覆盖对齐 [3X-UI](https://github.com/MHSanaei/3x-ui) 入站类型（仍为**单用户**，无面板 / 多用户计费）：
+  - VLESS / VMess / Trojan：TCP、WebSocket、gRPC、HTTPUpgrade、XHTTP、mKCP；安全层 TLS / REALITY / none；VLESS 可开 Vision
+  - Shadowsocks：2022（128/256/chacha）以及 aes-gcm / chacha20-ietf-poly1305
+  - Hysteria2（sing-box）、WireGuard 入站、HTTP 入站、SOCKS5 入站、Tunnel（dokodemo-door）
+  - 快捷项：一键 Reality、VLESS-WS-TLS、VMess-WS-TLS、Trojan-TLS（与 v2ray-agent 分享链接兼容）
+  - 不做：多用户额度、Telegram 机器人、TUN / AmneziaWG / MTProto（非 Xray 标准入站或需独立栈）
 - Nginx：TLS 反代 WebSocket、ACME webroot、站点伪装（`www.python.org`）、HTTPS 订阅
 - ACME（Let's Encrypt / acme.sh）或自签名证书
 - 通用订阅（base64）+ Clash Meta YAML 订阅 + 分享链接 / 二维码
-- 出站：SOCKS5（Shifter）、直连、Cloudflare WARP（wgcf → Xray wireguard）
-- 分流：BT 阻断、广告拦截、国内直连、域名黑名单
+- 出站条目与 v2ray-agent 对齐：`proxy` / `direct` / `z_direct_outbound` / `IPv4_out` / `IPv6_out` / `blackhole_out`，可选 `socks5_outbound`、WARP
+- 分流：BT 阻断、广告拦截、国内直连、域名黑名单、IPv6 出站域名
 - BBR 加速、SSH 端口、备份恢复、核心更新
-- systemd 看门狗；**改配置时自动暂停看门狗**
+- systemd 看门狗：端口/API 健康、坏配置重建、出站故障切直连、NTP、证书续签、每周更新核心与 geo 数据；**改配置时自动暂停**
 
 ## 安装命令
 
@@ -57,6 +62,7 @@ xcc status       状态面板
 xcc update       从 GitHub 更新主脚本（保留 /etc/xcc/ 配置）
 xcc uninstall    卸载（需输入 yes 确认）
 xcc version      显示版本
+xcc selftest     离线自检（Reality / 出站 / 路由 / 分享链接）
 ```
 
 `xcc run` 启动时会检查 GitHub 最新版本；若有新版本会提示执行 `xcc update`。
@@ -66,7 +72,7 @@ xcc version      显示版本
 ## 使用截图（TUI 示意）
 
 ```text
-┌────────────── xcc 2.1.0  |  仅支持单用户配置 ──────────────┐
+┌────────────── xcc 2.2.2  |  仅支持单用户配置 ──────────────┐
 │ xcc 主菜单                                                 │
 │                                                            │
 │     d  状态面板 / 流量                                     │
@@ -76,12 +82,15 @@ xcc version      显示版本
 │     v  配置 VLESS-WS-TLS                                   │
 │     m  配置 VMess-WS-TLS                                   │
 │     t  配置 Trojan-TLS                                     │
-│     s  配置 Shadowsocks 2022                               │
+│     s  配置 Shadowsocks                                    │
+│     p  更多协议（gRPC/XHTTP/WG/HTTP/SOCKS/Tunnel）          │
 │     3  管理节点                                            │
 │     u  订阅 / 分享链接                                     │
 │     5  出站 / WARP / 分流                                  │
 │     c  证书（ACME）                                        │
 │     b  启用 BBR 加速                                       │
+│     k  更新核心（Xray/sing-box/Nginx/xcc）                 │
+│     r  重置看门狗保护                                      │
 │     0  退出                                                │
 │                    <确定>          <取消>                  │
 └────────────────────────────────────────────────────────────┘
@@ -122,15 +131,19 @@ Reality 节点创建成功后，终端会打印 VLESS 分享链接，并用 `qre
 - VLESS-WS / VMess 由 Nginx 反代到本机 `127.0.0.1:31297` / `31299`，Xray 对应 inbound 为 `security=none`。
 - 根路径伪装反代 `https://www.python.org`；订阅：`https://域名:443/s/TOKEN` 与 `https://域名:443/s/TOKEN.clash.yaml`。无证书时订阅走 HTTP `sub_port`（默认 2096）。
 - Hysteria2 默认 UDP 443，可与 Nginx TCP 443 并存。Reality 不要再占用同一 TCP 443。
+- 主菜单 **p 更多协议**：按 3X-UI 的入站矩阵选协议 + 传输层 + 安全层。gRPC / XHTTP / TCP+TLS 由 Xray 本机监听；WS / HTTPUpgrade 有证书时仍走 Nginx。WireGuard / HTTP / SOCKS / Tunnel 为独立端口。
 
 ## Reality 约定
 
-与 v2ray-agent 的 VLESS+Reality+Vision 对齐：
+与 v2ray-agent 的 `07_VLESS_vision_reality_inbounds.json` 对齐：
 
 - 必须安装支持 XTLS/Reality 的最新 Xray
+- **双层入站**：公网端口 `dokodemo-door`（`destOverride: tls` + `routeOnly`）转发到 `127.0.0.1:45987`；内层 VLESS Reality Vision（`fallbacks: []`）
+- dokodemo 入站固定走 `z_direct_outbound`（即使全局 SOCKS5 也不绕路）
 - 服务端 `realitySettings.target`（`dest` 别名）、`minClientVer=1.8.2`、`maxTimeDiff=70000`
 - `shortIds`: `["", "6ba85179e30d4fc2"]`（可另含本节点 shortId）
 - `flow=xtls-rprx-vision`，`fingerprint=chrome`
+- 目标域名支持 X25519MLKEM768 且证书链 > 3500 时自动生成 ML-DSA-65（与 v2ray-agent 相同）
 - sniffing 开启 `routeOnly`（避免 Reality 被 sniff 改写目标）
 - 日志：`"log": {"loglevel": "warning"}`
 - 分享链接格式（参数顺序与 v2ray-agent 相同）：
@@ -149,22 +162,37 @@ hysteria2://密码@host:port?peer=host&insecure=0&sni=host&alpn=h3#备注
 
 ## 看门狗
 
-服务名：`xcc-watchdog`（`Restart=always`，开机自启）。
+服务名：`xcc-watchdog`（`Restart=always`，开机自启）。每分钟一轮。
 
-每分钟检查：
+**进程与配置**
 
-- Xray / sing-box（有 Hysteria2 节点时）/ Nginx 进程，异常则 `systemctl restart`
-- 从 `outbound.conf` 读取 SOCKS5，核对出口 IP（ipify），探测 google.com
-- 磁盘使用率 > 85%：ERROR + `wall`
-- 1 分钟负载 > CPU 核心数 × 2：WARN
-- 写入日志前若 `/var/log/xcc.log` > 50MB 则自行轮转
-- 启动时删除 7 天前的 `xcc.log.*`
+- 不只看 `is-active`：校验 `nodes.json` / Xray JSON / `nginx -t` / sing-box check
+- 配置坏了先从 `nodes.json` 重建，避免坏配置重启死循环
+- 核对应监听的 TCP/UDP 端口；Xray 再探 `127.0.0.1:10085` Stats API（超时视为卡死）
+- 连续 2 分钟不健康才重启；Xray / sing-box / Nginx **各自** 5 分钟内重启超过 3 次则熔断，等主菜单重置
+- TUI 开着时不自动重启、不自动改配置
 
-若 **5 分钟内重启超过 3 次**，停止自动重启并 `wall` 紧急告警，等待人工介入（TUI 中可「重置看门狗保护」）。
+**出站**
 
-配置 Reality / Hysteria2 / Nginx、管理节点、设置出站、修改 SSH 端口、恢复配置时会 `systemctl stop xcc-watchdog`；完成后（含失败、取消、异常退出）自动 `systemctl start xcc-watchdog`。**备份配置不停止看门狗。** 暂停期间现有连接继续处理流量。
+- SOCKS5 连续失败 3 次：备份原出站，切 `DIRECT` 并重载 Xray / sing-box
+- 原 SOCKS5 连续恢复 2 次：自动切回
 
-systemd 服务使用 `StandardOutput=null` 与 `StandardError=null`，避免 journal 占满磁盘。logrotate：每天 / 3 份 / 压缩 / `size 50M`，写入 `/etc/logrotate.d/xcc`。
+**系统健康（每分钟）**
+
+- NTP：`timedatectl set-ntp true`，仍不同步则 `chronyc makestep` / `ntpdate`（避免 Reality 因时钟漂移失败）
+- 磁盘 > 85%：清理 xcc 旧日志、临时文件、journal（200M）
+- 负载 > CPU×2：WARN
+- 日志轮转：写入前 > 50MB 切开；每分钟删除 7 天前的 `xcc.log.*` 和过期临时文件
+- 证书剩余 ≤ 21 天：acme.sh 续签并 reload
+
+**每周自动更新**（首次启动只打时间戳，满 7 天才跑；TUI 占用则推迟）
+
+- Let's Encrypt 续签、`geoip.dat` / `geosite.dat`
+- Xray、sing-box（已安装或有 Hysteria2 时）、xcc 脚本（有新版本则覆盖并重启看门狗）
+
+配置 Reality / 节点 / 出站等时会停看门狗；完成后自动恢复。**备份不停止看门狗。**
+
+systemd 服务 `StandardOutput=null`。logrotate：每天 / 3 份 / `size 50M`。
 
 ## Ubuntu 24.04+ 适配
 

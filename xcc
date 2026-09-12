@@ -2,9 +2,9 @@
 #===============================================================================
 #  xcc - Xray / sing-box / Nginx 节点管理工具
 #  Author : xcc
-#  Version: 2.1.0
-#  Description: 单用户 Reality + sing-box Hysteria2 + Nginx 节点管理（中文 TUI）
-#               仅支持单用户配置。目标系统：Ubuntu 24.04+ / Debian 12+ / CentOS 9+
+#  Version: 2.2.2
+#  Description: 单用户 Xray / sing-box / Nginx 节点管理（中文 TUI）
+#               入站覆盖对齐 3X-UI。目标系统：Ubuntu 24.04+ / Debian 12+ / CentOS 9+
 #===============================================================================
 
 # 不使用 set -e：whiptail/dialog 取消操作会返回非零，导致脚本误退出。
@@ -22,8 +22,8 @@ NC='\033[0m'
 #-------------------------------------------------------------------------------
 # 版本与仓库
 #-------------------------------------------------------------------------------
-XCC_VERSION="2.1.0"
-XCC_CONFIG_FORMAT="2"
+XCC_VERSION="2.2.2"
+XCC_CONFIG_FORMAT="3"
 XCC_GITHUB_USER="${XCC_GITHUB_USER:-wang-xinchen007}"
 XCC_GITHUB_REPO="${XCC_GITHUB_REPO:-xcc}"
 XCC_GITHUB_BRANCH="${XCC_GITHUB_BRANCH:-main}"
@@ -54,23 +54,44 @@ NGINX_WWW="${XCC_DIR}/www"
 NGINX_CONF="/etc/nginx/conf.d/xcc.conf"
 XRAY_VLESS_WS_LOCAL=31297
 XRAY_VMESS_WS_LOCAL=31299
+XRAY_LOCAL_PORT_MIN=31280
+XRAY_LOCAL_PORT_MAX=31380
+# 与 v2ray-agent 07_VLESS_vision_reality 内层端口一致
+XRAY_REALITY_LOCAL=45987
+XRAY_API_PORT=10085
 HYSTERIA_BIN="${SINGBOX_BIN}"
 HYSTERIA_DIR="${SINGBOX_DIR}"
 HYSTERIA_CONF="${SINGBOX_CONF}"
 XCC_CERT_DIR="${XCC_DIR}/certs"
 XCC_SUB_DIR="${XCC_DIR}/subscribe"
 XCC_WARP_FILE="${XCC_DIR}/warp.json"
-XCC_SETTINGS_DEFAULT='{"block_bt":true,"block_ads":false,"cn_direct":false,"domain_block":[],"sub_token":"","sub_port":2096,"nginx_port":443,"cert":"","key":"","domain":"","warp":false,"hy_up_mbps":100,"hy_down_mbps":50}'
+XCC_SETTINGS_DEFAULT='{"block_bt":true,"block_ads":false,"cn_direct":false,"domain_block":[],"ipv6_domains":[],"sub_token":"","sub_port":2096,"nginx_port":443,"cert":"","key":"","domain":"","warp":false,"hy_up_mbps":100,"hy_down_mbps":50}'
 # 与 v2ray-agent 重合的 Reality / Hysteria2 默认值（分享链接、shortId、伪装站必须一致）
 REALITY_DEFAULT_SID="6ba85179e30d4fc2"
 REALITY_DEFAULT_SNI="download-installer.cdn.mozilla.net"
 REALITY_MIN_CLIENT_VER="1.8.2"
 REALITY_MAX_TIME_DIFF=70000
+# 与 v2ray-agent initRealityClientServersName（Xray 核心）默认列表一致
+REALITY_DEST_LIST="download-installer.cdn.mozilla.net,addons.mozilla.org,s0.awsstatic.com,d1.awsstatic.com,images-na.ssl-images-amazon.com,m.media-amazon.com,player.live-video.net,one-piece.com,lol.secure.dyn.riotcdn.net,www.lovelive-anime.jp,academy.nvidia.com,dl.google.com,www.google-analytics.com,www.caltech.edu,www.calstatela.edu,www.suny.edu,www.suffolk.edu,www.python.org,vuejs-jp.org,vuejs.org,zh-hk.vuejs.org,react.dev,www.java.com,www.oracle.com,www.mysql.com,www.mongodb.com,redis.io,cname.vercel-dns.com,vercel-dns.com,www.swift.com,www.cisco.com,www.asus.com,www.samsung.com,www.amd.com,www.umcg.nl,www.fom-international.com,www.u-can.co.jp,github.io"
 HYSTERIA_DEFAULT_UP_MBPS=100
 HYSTERIA_DEFAULT_DOWN_MBPS=50
 XRAY_API_ADDR="127.0.0.1:10085"
 WATCHDOG_HALT="${XCC_DIR}/.watchdog-halt"
+WATCHDOG_HALT_SB="${XCC_DIR}/.watchdog-halt-singbox"
+WATCHDOG_HALT_NGINX="${XCC_DIR}/.watchdog-halt-nginx"
 WATCHDOG_RESTARTS="${XCC_DIR}/.watchdog-restarts"
+WATCHDOG_RESTARTS_SB="${XCC_DIR}/.watchdog-restarts-singbox"
+WATCHDOG_RESTARTS_NGINX="${XCC_DIR}/.watchdog-restarts-nginx"
+WATCHDOG_UNHEALTHY_XRAY="${XCC_DIR}/.watchdog-unhealthy-xray"
+WATCHDOG_UNHEALTHY_SB="${XCC_DIR}/.watchdog-unhealthy-singbox"
+WATCHDOG_UNHEALTHY_NGINX="${XCC_DIR}/.watchdog-unhealthy-nginx"
+WATCHDOG_SOCKS_FAILS="${XCC_DIR}/.socks-fails"
+WATCHDOG_SOCKS_RECOVER="${XCC_DIR}/.socks-recover"
+WATCHDOG_OUTBOUND_ORIG="${XCC_DIR}/outbound.conf.watchdog-orig"
+WATCHDOG_WEEKLY_STAMP="${XCC_DIR}/.weekly-stamp"
+WATCHDOG_WEEKLY_SECS=604800
+XRAY_DAT_DIR="/usr/local/share/xray"
+XRAY_INSTALL_DAT_URL="https://github.com/XTLS/Xray-install/raw/main/install-dat-release.sh"
 LOGROTATE_CONF="/etc/logrotate.d/xcc"
 WATCHDOG_UNIT="/etc/systemd/system/xcc-watchdog.service"
 SINGBOX_UNIT="/etc/systemd/system/sing-box.service"
@@ -523,6 +544,9 @@ tui_yesno() {
       read -r -p "${text} [y/N]: " ans || return 1
       [[ "${ans}" == "y" || "${ans}" == "Y" || "${ans}" == "yes" ]]
       ;;
+    none|"")
+      return 1
+      ;;
   esac
 }
 
@@ -541,6 +565,9 @@ tui_msg() {
       echo
       printf '%b== %s ==%b\n%s\n' "${BLUE}" "${title}" "${NC}" "${text}"
       read -r -p "按回车继续..." _ || true
+      ;;
+    none|"")
+      printf '%s: %s\n' "${title}" "${text}"
       ;;
   esac
 }
@@ -579,6 +606,9 @@ tui_textbox_file() {
       echo
       cat "${file}"
       read -r -p "按回车继续..." _ || true
+      ;;
+    none|"")
+      [[ -f "${file}" ]] && cat "${file}" || true
       ;;
   esac
 }
@@ -785,7 +815,7 @@ ensure_dirs() {
     "$(dirname "${XRAY_CONF}")" "${XCC_TMP_DIR}" "${XCC_CACHE_DIR}"
   chmod 700 "${XCC_DIR}" "${XCC_BACKUP_DIR}" "${SINGBOX_DIR}" "${XCC_CERT_DIR}"
   if [[ ! -f "${XCC_NODES}" ]]; then
-    printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vmess":[],"trojan":[],"shadowsocks":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${XCC_NODES}"
+    printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vless":[],"vmess":[],"trojan":[],"shadowsocks":[],"wireguard":[],"http":[],"socks":[],"tunnel":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${XCC_NODES}"
     chmod 600 "${XCC_NODES}"
   else
     migrate_nodes_json
@@ -806,12 +836,21 @@ migrate_nodes_json() {
       .reality //= []
       | .hysteria //= []
       | .vless_ws //= []
+      | .vless //= []
       | .vmess //= []
       | .trojan //= []
       | .shadowsocks //= []
+      | .wireguard //= []
+      | .http //= []
+      | .socks //= []
+      | .tunnel //= []
       | .settings = ($st + (.settings // {}))
+      | .settings.ipv6_domains //= []
       | .reality = [
-          .reality[]
+          .reality
+          | to_entries[]
+          | .key as $i
+          | .value
           | .sni = (.sni // $sni)
           | .dest = (
               if (.dest // "") != "" then .dest
@@ -822,6 +861,7 @@ migrate_nodes_json() {
           | .email = (.email // .tag // "xcc")
           | .flow = (.flow // "xtls-rprx-vision")
           | .fingerprint = (.fingerprint // "chrome")
+          | .xray_port = (.xray_port // (45987 - $i))
         ]
       | .hysteria = [
           .hysteria[]
@@ -830,8 +870,13 @@ migrate_nodes_json() {
           | .down_mbps = (.down_mbps // $st.hy_down_mbps // 50)
         ]
       | .vless_ws = [ .vless_ws[] | .email = (.email // .tag // "xcc") | .host = (.host // .sni // "") | .xray_port = (.xray_port // 31297) ]
-      | .vmess = [ .vmess[] | .email = (.email // .tag // "xcc") | .network = (.network // "ws") | .xray_port = (.xray_port // 31299) ]
-      | .trojan = [ .trojan[] | .email = (.email // .tag // "xcc") | .network = (.network // "tcp") ]
+      | .vless = [ .vless[] | .email = (.email // .tag // "xcc") | .network = (.network // "tcp") | .security = (.security // "tls") | .host = (.host // .sni // "") ]
+      | .vmess = [ .vmess[] | .email = (.email // .tag // "xcc") | .network = (.network // "ws") | .security = (.security // "tls") | .xray_port = (.xray_port // 31299) ]
+      | .trojan = [ .trojan[] | .email = (.email // .tag // "xcc") | .network = (.network // "tcp") | .security = (.security // "tls") ]
+      | .wireguard = [ .wireguard[] | .email = (.email // .tag // "xcc") ]
+      | .http = [ .http[] | .email = (.email // .tag // "xcc") ]
+      | .socks = [ .socks[] | .email = (.email // .tag // "xcc") ]
+      | .tunnel = [ .tunnel[] | .email = (.email // .tag // "xcc") ]
     ' 2>/dev/null || true
 }
 
@@ -1004,8 +1049,14 @@ port_used_by_nodes() {
   local skip_tag="${2:-}"
   jq -r --arg skip "${skip_tag}" --argjson port "${port}" '
     (.reality[]? | select(.tag != $skip) | .port),
+    (.reality[]? | select(.tag != $skip) | .xray_port),
+    (.vless[]? | select(.tag != $skip and ((.network // "tcp") != "kcp")) | .port),
     (.trojan[]? | select(.tag != $skip) | .port),
-    (.shadowsocks[]? | select(.tag != $skip) | .port)
+    (.shadowsocks[]? | select(.tag != $skip) | .port),
+    (.http[]? | select(.tag != $skip) | .port),
+    (.socks[]? | select(.tag != $skip) | .port),
+    (.tunnel[]? | select(.tag != $skip) | .port),
+    (.wireguard[]? | select(.tag != $skip) | .port)
   ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}" && return 0
   if nginx_front_enabled; then
     [[ "$(nginx_public_port)" == "${port}" ]] && return 0
@@ -1022,7 +1073,11 @@ udp_port_used_by_nodes() {
   local port="$1"
   local skip_tag="${2:-}"
   jq -r --arg skip "${skip_tag}" --argjson port "${port}" '
-    (.hysteria[]? | select(.tag != $skip) | .port)
+    (.hysteria[]? | select(.tag != $skip) | .port),
+    (.wireguard[]? | select(.tag != $skip) | .port),
+    (.tunnel[]? | select(.tag != $skip) | .port),
+    (.vless[]? | select(.tag != $skip and (.network // "") == "kcp") | .port),
+    (.vmess[]? | select(.tag != $skip and (.network // "") == "kcp") | .port)
   ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}"
 }
 
@@ -1071,10 +1126,15 @@ assert_nginx_listen_port() {
   fi
   if jq -r --argjson port "${port}" '
       (.reality[]? | .port),
+      (.reality[]? | .xray_port),
+      (.vless[]? | select((.network // "tcp") != "kcp") | .port),
       (.trojan[]? | .port),
-      (.shadowsocks[]? | .port)
+      (.shadowsocks[]? | .port),
+      (.http[]? | .port),
+      (.socks[]? | .port),
+      (.tunnel[]? | .port)
     ' "${XCC_NODES}" 2>/dev/null | grep -qx "${port}"; then
-    tui_msg "端口占用" "TCP ${port} 已被 Reality / Trojan / Shadowsocks 占用，Nginx 无法共用。请换端口。"
+    tui_msg "端口占用" "TCP ${port} 已被 Reality / VLESS / Trojan / SS / HTTP / SOCKS 等占用，Nginx 无法共用。请换端口。"
     return 1
   fi
   if port_busy_tcp "${port}"; then
@@ -1144,6 +1204,7 @@ link_binary() {
 
 # 安装最新 TLS 版本 Xray（官方脚本，失败则降级包管理器）。
 install_xray() {
+  local mode="${1:-ask}"
   local script latest installed
   latest=$(github_latest_tag "${XRAY_RELEASE_API}" || true)
   installed=$(xray_installed_version || true)
@@ -1151,7 +1212,9 @@ install_xray() {
   if [[ -x "${XRAY_BIN}" ]]; then
     info "已安装 Xray ${installed:-unknown}，最新版本 ${latest:-unknown}"
     if [[ -n "${latest}" ]] && version_newer "${latest}" "${installed}"; then
-      if tui_yesno "Xray 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级到最新 TLS 版本？"; then
+      if [[ "${mode}" == "auto" ]]; then
+        xcc_log INFO "自动升级 Xray ${installed} -> ${latest}"
+      elif tui_yesno "Xray 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级到最新 TLS 版本？"; then
         :
       else
         return 0
@@ -1189,6 +1252,46 @@ install_xray() {
   info "Xray 安装完成: $(xray_installed_version || echo unknown)"
 }
 
+install_geodata() {
+  local script dest
+  dest="${XRAY_DAT_DIR}"
+  mkdir -p "${dest}"
+  script=$(xcc_mktemp)
+  if xcc_curl "${script}" "${XRAY_INSTALL_DAT_URL}" 2>/dev/null && bash "${script}" >/dev/null 2>&1; then
+    rm -f "${script}"
+    xcc_log INFO "已更新 Xray geoip/geosite（官方 dat 脚本）"
+    return 0
+  fi
+  rm -f "${script}"
+  local geoip geosite url
+  geoip=$(xcc_mktemp)
+  geosite=$(xcc_mktemp)
+  for url in \
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" \
+    "https://ghproxy.net/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat"; do
+    if xcc_curl "${geoip}" "${url}" 2>/dev/null; then
+      break
+    fi
+  done
+  for url in \
+    "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" \
+    "https://ghproxy.net/https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat"; do
+    if xcc_curl "${geosite}" "${url}" 2>/dev/null; then
+      break
+    fi
+  done
+  if [[ -s "${geoip}" && -s "${geosite}" ]]; then
+    mv "${geoip}" "${dest}/geoip.dat"
+    mv "${geosite}" "${dest}/geosite.dat"
+    chmod 644 "${dest}/geoip.dat" "${dest}/geosite.dat"
+    xcc_log INFO "已更新 Xray geoip/geosite（Loyalsoldier）"
+    return 0
+  fi
+  rm -f "${geoip}" "${geosite}"
+  xcc_log WARN "geoip/geosite 更新失败"
+  return 1
+}
+
 install_hysteria() {
   install_singbox
 }
@@ -1211,6 +1314,7 @@ github_release_urls() {
 }
 
 install_singbox() {
+  local mode="${1:-ask}"
   local latest installed arch ver url tmp dir
   latest=$(github_latest_tag "${SINGBOX_RELEASE_API}" || true)
   installed=$(singbox_installed_version || true)
@@ -1219,7 +1323,9 @@ install_singbox() {
   if [[ -x "${SINGBOX_BIN}" ]]; then
     info "已安装 sing-box ${installed:-unknown}，最新版本 ${latest:-unknown}"
     if [[ -n "${latest}" ]] && version_newer "${latest}" "${installed}"; then
-      if ! tui_yesno "sing-box 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级？"; then
+      if [[ "${mode}" == "auto" ]]; then
+        xcc_log INFO "自动升级 sing-box ${installed} -> ${latest}"
+      elif ! tui_yesno "sing-box 升级" "检测到新版本 ${latest}（当前 ${installed}）。是否升级？"; then
         return 0
       fi
     else
@@ -1635,44 +1741,50 @@ apply_hysteria_config() {
   apply_singbox_config
 }
 
+nginx_emit_upgrade_location() {
+  local path="$1" xport="$2"
+  [[ -n "${path}" && -n "${xport}" ]] || return 0
+  cat <<EOF
+    location ${path} {
+        if (\$http_upgrade != "websocket") { return 444; }
+        proxy_pass http://127.0.0.1:${xport};
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header Host \$host;
+        proxy_redirect off;
+    }
+EOF
+}
+
 nginx_ws_locations() {
   local json path xport
   while IFS= read -r json; do
     [[ -n "${json}" ]] || continue
     path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
     xport=$(printf '%s' "${json}" | jq -r --argjson d "${XRAY_VLESS_WS_LOCAL}" '.xray_port // $d')
-    cat <<EOF
-    location ${path} {
-        if (\$http_upgrade != "websocket") { return 444; }
-        proxy_pass http://127.0.0.1:${xport};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header Host \$host;
-        proxy_redirect off;
-    }
-EOF
+    nginx_emit_upgrade_location "${path}" "${xport}"
   done < <(jq -c '.vless_ws[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
   while IFS= read -r json; do
     [[ -n "${json}" ]] || continue
     path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
     xport=$(printf '%s' "${json}" | jq -r --argjson d "${XRAY_VMESS_WS_LOCAL}" '.xray_port // $d')
-    cat <<EOF
-    location ${path} {
-        if (\$http_upgrade != "websocket") { return 444; }
-        proxy_pass http://127.0.0.1:${xport};
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header Host \$host;
-        proxy_redirect off;
-    }
-EOF
-  done < <(jq -c '.vmess[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+    nginx_emit_upgrade_location "${path}" "${xport}"
+  done < <(jq -c '.vmess[]? | select(.enabled==true and ((.network // "ws") == "ws" or (.network // "") == "httpupgrade"))' "${XCC_NODES}" 2>/dev/null)
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
+    xport=$(printf '%s' "${json}" | jq -r --argjson d "${XRAY_VLESS_WS_LOCAL}" '.xray_port // $d')
+    nginx_emit_upgrade_location "${path}" "${xport}"
+  done < <(jq -c '.vless[]? | select(.enabled==true and ((.network // "") == "ws" or (.network // "") == "httpupgrade"))' "${XCC_NODES}" 2>/dev/null)
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    path=$(printf '%s' "${json}" | jq -r '.path // "/xcc"')
+    xport=$(printf '%s' "${json}" | jq -r --argjson d 31300 '.xray_port // $d')
+    nginx_emit_upgrade_location "${path}" "${xport}"
+  done < <(jq -c '.trojan[]? | select(.enabled==true and ((.network // "") == "ws" or (.network // "") == "httpupgrade"))' "${XCC_NODES}" 2>/dev/null)
 }
 
 apply_nginx_config() {
@@ -1792,14 +1904,13 @@ apply_all_configs() {
   return 0
 }
 
-# 根据 nodes.json + outbound.conf 重建 Xray 配置。
-# 路由：API → BT/广告/域名黑名单 → 各入站独立出站 → CN 直连 → 默认出站。
-apply_xray_config() {
-  local tmp dns_json mode proxy_json node_json warp_json has_geo
-  ensure_xray_inbounds_array
-  migrate_nodes_json
+# 根据 nodes.json + outbound.conf 生成 Xray JSON（不写盘、不 reload）。供 apply / selftest 共用。
+build_xray_config_json() {
+  local dest="$1"
+  local dns_json mode proxy_json socks5_json node_json warp_json has_geo nginx_front
   dns_json=$(dns_servers_json)
   mode=$(outbound_mode)
+  socks5_json='null'
 
   if [[ "${mode}" == "proxy" ]]; then
     local url
@@ -1825,6 +1936,9 @@ apply_xray_config() {
   else
     proxy_json='{"tag":"proxy","protocol":"freedom","settings":{}}'
   fi
+  if [[ "${mode}" == "proxy" ]]; then
+    socks5_json=$(printf '%s' "${proxy_json}" | jq '.tag="socks5_outbound"')
+  fi
 
   warp_json='null'
   if [[ -f "${XCC_WARP_FILE}" ]] && jq empty "${XCC_WARP_FILE}" 2>/dev/null; then
@@ -1836,19 +1950,21 @@ apply_xray_config() {
   fi
 
   node_json=$(cat "${XCC_NODES}")
-  tmp=$(xcc_mktemp .json)
-  local nginx_front="false"
+  nginx_front="false"
   nginx_front_enabled && nginx_front="true"
 
   if ! jq -n \
     --argjson dns "${dns_json}" \
     --argjson nodes "${node_json}" \
     --argjson proxy "${proxy_json}" \
+    --argjson socks5 "${socks5_json}" \
     --argjson warp "${warp_json}" \
     --argjson has_geo "${has_geo}" \
     --argjson nginx_front "${nginx_front}" \
     --argjson vless_local "${XRAY_VLESS_WS_LOCAL}" \
     --argjson vmess_local "${XRAY_VMESS_WS_LOCAL}" \
+    --argjson reality_local "${XRAY_REALITY_LOCAL}" \
+    --argjson api_port "${XRAY_API_PORT}" \
     --arg default_tag "$( [[ "${mode}" == "proxy" ]] && echo proxy || echo direct )" \
     --arg reality_sid "${REALITY_DEFAULT_SID}" \
     --argjson max_time_diff "${REALITY_MAX_TIME_DIFF}" \
@@ -1874,41 +1990,109 @@ apply_xray_config() {
       + (if $network == "ws" then {
            wsSettings: {path: (.path // "/xcc"), headers: {Host: (.host // .sni // "")}}
          } else {} end);
+    def net:
+      (.network // "tcp")
+      | if . == "websocket" then "ws"
+        elif . == "mkcp" then "kcp"
+        elif . == "raw" then "tcp"
+        else . end;
+    def nginxable:
+      (net == "ws" or net == "httpupgrade");
+    def transport:
+      (net) as $n
+      | if $n == "ws" then
+          {wsSettings: {path: (.path // "/xcc"), headers: {Host: (.host // .sni // "")}}}
+        elif $n == "grpc" then
+          {grpcSettings: {serviceName: (.service_name // .path // "grpc")}}
+        elif $n == "httpupgrade" then
+          {httpupgradeSettings: {path: (.path // "/xcc"), host: (.host // .sni // "")}}
+        elif $n == "xhttp" then
+          {xhttpSettings: (
+            {path: (.path // "/xhttp"), mode: (.xhttp_mode // "auto")}
+            + (if (.host // .sni // "") == "" then {} else {host: (.host // .sni)} end)
+          )}
+        elif $n == "kcp" then
+          {kcpSettings: (
+            {
+              mtu: 1350, tti: 50, uplinkCapacity: 100, downlinkCapacity: 100,
+              congestion: false, readBufferSize: 2, writeBufferSize: 2,
+              header: {type: (.header_type // "none")}
+            } + (if (.seed // "") == "" then {} else {seed: .seed} end)
+          )}
+        elif $n == "tcp" and (.header_type // "none") == "http" then
+          {tcpSettings: {header: {type: "http", request: {path: [(.path // "/")], headers: {Host: [(.host // .sni // "")]}}}}}
+        else {} end;
+    def sec_tls:
+      {
+        security: "tls",
+        tlsSettings: {
+          minVersion: "1.2",
+          alpn: (if (net == "grpc" or net == "xhttp") then ["h2","http/1.1"]
+                 elif net == "tcp" then ["http/1.1"]
+                 else ["h2","http/1.1"] end),
+          certificates: [{certificateFile: certfile, keyFile: keyfile}]
+        }
+      };
     def reality_target:
       if (.dest // "") != "" then .dest
       elif (.target // "") != "" then .target
       else ((.sni // "download-installer.cdn.mozilla.net") + ":443") end;
     def reality_short_ids:
-      (["", $reality_sid] + [(.short_id // "")] + (.short_ids // []))
-      | unique
-      | map(select(. != null));
-    def reality_inbound:
+      reduce (["", $reality_sid] + [(.short_id // "")] + (.short_ids // []))[] as $x
+        ([]; if $x == null or (index($x) != null) then . else . + [$x] end);
+    def reality_local:
+      (.xray_port // $reality_local);
+    def reality_settings:
       {
-        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vless",
+        show: false,
+        target: reality_target,
+        xver: 0,
+        serverNames: [.sni],
+        privateKey: .private_key,
+        publicKey: (.public_key // ""),
+        minClientVer: $min_client_ver,
+        maxTimeDiff: $max_time_diff,
+        shortIds: reality_short_ids
+      }
+      + (if (.mldsa65_seed // "") != "" then {mldsa65Seed: .mldsa65_seed} else {} end)
+      + (if (.mldsa65_verify // "") != "" then {mldsa65Verify: .mldsa65_verify} else {} end);
+    def reality_dokodemo:
+      {
+        tag: ("dokodemo-in-" + .tag),
+        port: .port,
+        protocol: "dokodemo-door",
+        settings: {address: "127.0.0.1", port: reality_local, network: "tcp"},
+        sniffing: {enabled: true, destOverride: ["tls"], routeOnly: true}
+      };
+    def reality_vision:
+      {
+        tag: .tag, listen: "127.0.0.1", port: reality_local, protocol: "vless",
         settings: {
           clients: [{id: .uuid, flow: (.flow // "xtls-rprx-vision"), email: (.email // .tag // "xcc")}],
-          decryption: "none"
+          decryption: "none",
+          fallbacks: []
         },
         streamSettings: {
           network: "tcp", security: "reality",
-          realitySettings: (
-            {
-              show: false,
-              target: reality_target,
-              xver: 0,
-              serverNames: [.sni],
-              privateKey: .private_key,
-              publicKey: (.public_key // ""),
-              minClientVer: $min_client_ver,
-              maxTimeDiff: $max_time_diff,
-              shortIds: reality_short_ids
-            }
-            + (if (.mldsa65_seed // "") != "" then {mldsa65Seed: .mldsa65_seed} else {} end)
-            + (if (.mldsa65_verify // "") != "" then {mldsa65Verify: .mldsa65_verify} else {} end)
-          )
+          realitySettings: reality_settings
         },
         sniffing: sniff
       };
+    def reality_pair:
+      [reality_dokodemo, reality_vision];
+    def sec_reality:
+      {
+        security: "reality",
+        realitySettings: reality_settings
+      };
+    def stream_of:
+      {network: net}
+      + transport
+      + (if (.security // "tls") == "reality" then sec_reality
+         elif (.security // "tls") == "none" then {security: "none"}
+         else sec_tls end);
+    def vless_flow:
+      if (net == "tcp") and ((.security // "tls") == "tls" or (.security // "") == "reality") then (.flow // "") else "" end;
     def vless_ws_inbound:
       (
         if $nginx_front then
@@ -1930,34 +2114,66 @@ apply_xray_config() {
           }
         end
       );
+    def vless_inbound:
+      (
+        if $nginx_front and nginxable then
+          {
+            tag: .tag, listen: "127.0.0.1", port: (.xray_port // $vless_local), protocol: "vless",
+            settings: {clients: [{id: .uuid, email: (.email // .tag // "xcc")}], decryption: "none"},
+            streamSettings: ({network: net, security: "none"} + transport),
+            sniffing: sniff
+          }
+        else
+          {
+            tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vless",
+            settings: {
+              clients: [
+                {id: .uuid, email: (.email // .tag // "xcc")}
+                + (if vless_flow == "" then {} else {flow: vless_flow} end)
+              ],
+              decryption: "none"
+            },
+            streamSettings: stream_of,
+            sniffing: sniff
+          }
+        end
+      );
     def vmess_inbound:
       (
-        if $nginx_front then
+        if $nginx_front and nginxable then
           {
             tag: .tag, listen: "127.0.0.1", port: (.xray_port // $vmess_local), protocol: "vmess",
             settings: {clients: [{id: .uuid, alterId: 0, email: (.email // .tag // "xcc")}]},
-            streamSettings: {
-              network: "ws", security: "none",
-              wsSettings: {path: (.path // "/xcc"), headers: {Host: (.host // .sni // "")}}
-            },
+            streamSettings: ({network: net, security: "none"} + transport),
             sniffing: sniff
           }
         else
           {
             tag: .tag, listen: "0.0.0.0", port: .port, protocol: "vmess",
             settings: {clients: [{id: .uuid, alterId: 0, email: (.email // .tag // "xcc")}]},
-            streamSettings: tls_ss(.network // "ws"),
+            streamSettings: stream_of,
             sniffing: sniff
           }
         end
       );
     def trojan_inbound:
-      {
-        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "trojan",
-        settings: {clients: [{password: .password, email: (.email // .tag // "xcc")}]},
-        streamSettings: tls_ss(.network // "tcp"),
-        sniffing: sniff
-      };
+      (
+        if $nginx_front and nginxable then
+          {
+            tag: .tag, listen: "127.0.0.1", port: (.xray_port // 31300), protocol: "trojan",
+            settings: {clients: [{password: .password, email: (.email // .tag // "xcc")}]},
+            streamSettings: ({network: net, security: "none"} + transport),
+            sniffing: sniff
+          }
+        else
+          {
+            tag: .tag, listen: "0.0.0.0", port: .port, protocol: "trojan",
+            settings: {clients: [{password: .password, email: (.email // .tag // "xcc")}]},
+            streamSettings: stream_of,
+            sniffing: sniff
+          }
+        end
+      );
     def ss_inbound:
       {
         tag: .tag, listen: "0.0.0.0", port: .port, protocol: "shadowsocks",
@@ -1968,13 +2184,63 @@ apply_xray_config() {
         },
         sniffing: sniff
       };
+    def wg_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "wireguard",
+        settings: {
+          secretKey: .private_key,
+          address: [(.address // "10.0.0.1/24")],
+          peers: [{
+            publicKey: .client_public_key,
+            allowedIPs: [(.client_address // "10.0.0.2/32")]
+          }],
+          mtu: ((.mtu // 1420) | tonumber),
+          noKernelTun: true
+        }
+      };
+    def http_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "http",
+        settings: (
+          if (.username // "") == "" then {timeout: 300}
+          else {timeout: 300, accounts: [{user: .username, pass: .password}]} end
+        ),
+        sniffing: sniff
+      };
+    def socks_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "socks",
+        settings: (
+          {udp: true, auth: (if (.username // "") == "" then "noauth" else "password" end)}
+          + (if (.username // "") == "" then {} else {accounts: [{user: .username, pass: .password}]} end)
+        ),
+        sniffing: sniff
+      };
+    def tunnel_inbound:
+      {
+        tag: .tag, listen: "0.0.0.0", port: .port, protocol: "dokodemo-door",
+        settings: {
+          address: .target_address,
+          port: .target_port,
+          network: (.network // "tcp,udp")
+        },
+        sniffing: sniff
+      };
     def resolve_ob($node):
       ($node.outbound // $default_tag) as $o
-      | if $o == "warp" and ($warp == null) then $default_tag else $o end;
+      | if $o == "warp" and ($warp == null) then $default_tag
+        elif ($o == "socks5_outbound") and ($socks5 == null) then $default_tag
+        else $o end;
     def node_rule:
       {type:"field", inboundTag:[.tag], outboundTag: resolve_ob(.)};
+    def dokodemo_rule:
+      {type:"field", inboundTag:["dokodemo-in-" + .tag], outboundTag:"z_direct_outbound"};
+    def freedom_plain($tag):
+      {tag:$tag, protocol:"freedom", settings:{}};
+    def freedom_ds($tag; $ds):
+      {tag:$tag, protocol:"freedom", settings:{domainStrategy:$ds}};
     def api_in:
-      {listen:"127.0.0.1", port:10085, protocol:"dokodemo-door", settings:{address:"127.0.0.1"}, tag:"api"};
+      {listen:"127.0.0.1", port:$api_port, protocol:"dokodemo-door", settings:{address:"127.0.0.1"}, tag:"api"};
 
     ($nodes.settings // {}) as $st |
     {
@@ -1989,46 +2255,78 @@ apply_xray_config() {
         }
       },
       dns: {servers: $dns},
-      inbounds:
+      inbounds: (
         [api_in]
-        + [ $nodes.reality[]?     | select(.enabled == true) | reality_inbound ]
+        + [ $nodes.reality[]?     | select(.enabled == true) | reality_pair[] ]
         + [ $nodes.vless_ws[]?    | select(.enabled == true) | vless_ws_inbound ]
+        + [ $nodes.vless[]?       | select(.enabled == true) | vless_inbound ]
         + [ $nodes.vmess[]?       | select(.enabled == true) | vmess_inbound ]
         + [ $nodes.trojan[]?      | select(.enabled == true) | trojan_inbound ]
-        + [ $nodes.shadowsocks[]? | select(.enabled == true) | ss_inbound ],
-      outbounds:
-        (
-          [ (if $default_tag == "proxy" then $proxy else {tag:"direct", protocol:"freedom", settings:{}} end),
-            (if $default_tag == "proxy" then {tag:"direct", protocol:"freedom", settings:{}} else $proxy end),
-            {tag:"blackhole_out", protocol:"blackhole", settings:{}} ]
-          + (if $warp != null then [$warp] else [] end)
-        ),
+        + [ $nodes.shadowsocks[]? | select(.enabled == true) | ss_inbound ]
+        + [ $nodes.wireguard[]?   | select(.enabled == true) | wg_inbound ]
+        + [ $nodes.http[]?        | select(.enabled == true) | http_inbound ]
+        + [ $nodes.socks[]?       | select(.enabled == true) | socks_inbound ]
+        + [ $nodes.tunnel[]?      | select(.enabled == true) | tunnel_inbound ]
+      ),
+      outbounds: (
+        [ (if $default_tag == "proxy" then $proxy else freedom_plain("direct") end),
+          (if $default_tag == "proxy" then freedom_plain("direct") else $proxy end),
+          freedom_ds("z_direct_outbound"; "UseIP"),
+          freedom_ds("IPv4_out"; "ForceIPv4"),
+          freedom_ds("IPv6_out"; "ForceIPv6"),
+          {tag:"blackhole_out", protocol:"blackhole", settings:{}} ]
+        + (if $socks5 != null then [$socks5] else [] end)
+        + (if $warp != null then [$warp] else [] end)
+      ),
       routing: {
         domainStrategy: "AsIs",
-        rules:
+        rules: (
           [ {type:"field", inboundTag:["api"], outboundTag:"api"} ]
           + (if ($st.block_bt // true) then [{type:"field", protocol:["bittorrent"], outboundTag:"blackhole_out"}] else [] end)
           + (if ($st.block_ads // false) and $has_geo then [{type:"field", domain:["geosite:category-ads-all"], outboundTag:"blackhole_out"}] else [] end)
           + (if (($st.domain_block // [])|length) > 0 then [{type:"field", domain:($st.domain_block), outboundTag:"blackhole_out"}] else [] end)
+          + [{type:"field", domain:["domain:gstatic.com","domain:googleapis.com","domain:googleapis.cn"], outboundTag:"z_direct_outbound"}]
+          + (if (($st.ipv6_domains // [])|length) > 0 then [{type:"field", domain:($st.ipv6_domains), outboundTag:"IPv6_out"}] else [] end)
+          + [ $nodes.reality[]?      | select(.enabled == true) | dokodemo_rule ]
           + [ $nodes.shadowsocks[]?  | select(.enabled == true) | node_rule ]
           + [ $nodes.trojan[]?       | select(.enabled == true) | node_rule ]
           + [ $nodes.vmess[]?        | select(.enabled == true) | node_rule ]
+          + [ $nodes.vless[]?        | select(.enabled == true) | node_rule ]
           + [ $nodes.vless_ws[]?     | select(.enabled == true) | node_rule ]
           + [ $nodes.reality[]?      | select(.enabled == true) | node_rule ]
+          + [ $nodes.wireguard[]?    | select(.enabled == true) | node_rule ]
+          + [ $nodes.http[]?         | select(.enabled == true) | node_rule ]
+          + [ $nodes.socks[]?        | select(.enabled == true) | node_rule ]
+          + [ $nodes.tunnel[]?       | select(.enabled == true) | node_rule ]
           + (if ($st.cn_direct // false) and $has_geo then [
                {type:"field", domain:["geosite:cn"], outboundTag:"direct"},
                {type:"field", ip:["geoip:cn"], outboundTag:"direct"}
              ] else [] end)
+        )
       }
     }
-    ' > "${tmp}"; then
+    ' > "${dest}"; then
     err "jq 生成 Xray 配置失败，请检查 /etc/xcc/nodes.json"
     tui_msg "配置生成失败" "jq 无法生成 Xray JSON，请检查 nodes.json 是否损坏。"
+    rm -f "${dest}"
+    return 1
+  fi
+  return 0
+}
+
+# 根据 nodes.json + outbound.conf 重建 Xray 配置。
+# 路由：API → BT/广告/域名黑名单 → gstatic 直连 → Reality dokodemo 直连 → 各入站独立出站 → CN 直连。
+apply_xray_config() {
+  local tmp
+  ensure_xray_inbounds_array
+  migrate_nodes_json
+  tmp=$(xcc_mktemp .json)
+  if ! build_xray_config_json "${tmp}"; then
     rm -f "${tmp}"
     return 1
   fi
 
-  if ! xray_test_config "${tmp}"; then
+  if [[ -x "${XRAY_BIN}" ]] && ! xray_test_config "${tmp}"; then
     err "Xray 配置语法检查失败，已拒绝写入。"
     printf '%s\n' "${XRAY_TEST_ERR:-未知错误}" > "${XCC_TMP_DIR}/xray-test-err.txt"
     tui_textbox_file "Xray 配置检查失败（已拒绝写入）" "${XCC_TMP_DIR}/xray-test-err.txt"
@@ -2037,6 +2335,7 @@ apply_xray_config() {
   fi
   mv "${tmp}" "${XRAY_CONF}"
   chmod 600 "${XRAY_CONF}"
+  systemctl enable xray >/dev/null 2>&1 || true
   xray_reload_or_restart
   write_subscribe_files || true
 }
@@ -2088,6 +2387,173 @@ xray_uuid() {
     u=$(tr -d ' \n' < /proc/sys/kernel/random/uuid)
   fi
   printf '%s' "${u}"
+}
+
+alloc_xray_local_port() {
+  local p used
+  used=$(jq -r '
+    (.vless_ws[]?.xray_port), (.vless[]?.xray_port), (.vmess[]?.xray_port), (.trojan[]?.xray_port),
+    (.reality[]?.xray_port)
+  ' "${XCC_NODES}" 2>/dev/null)
+  for p in $(seq "${XRAY_LOCAL_PORT_MIN}" "${XRAY_LOCAL_PORT_MAX}"); do
+    [[ "${p}" == "${XRAY_VLESS_WS_LOCAL}" || "${p}" == "${XRAY_VMESS_WS_LOCAL}" || "${p}" == "${XRAY_REALITY_LOCAL}" || "${p}" == "${XRAY_API_PORT}" ]] && continue
+    printf '%s\n' "${used}" | grep -qx "${p}" && continue
+    port_busy_tcp "${p}" && continue
+    printf '%s' "${p}"
+    return 0
+  done
+  printf '%s' "${XRAY_LOCAL_PORT_MIN}"
+}
+
+# 与 v2ray-agent 相同：内层 Reality 默认 45987，多节点依次递减。
+alloc_reality_local_port() {
+  local p used
+  used=$(jq -r '(.reality[]?.xray_port), (.vless_ws[]?.xray_port), (.vless[]?.xray_port), (.vmess[]?.xray_port), (.trojan[]?.xray_port)' "${XCC_NODES}" 2>/dev/null)
+  for p in $(seq "${XRAY_REALITY_LOCAL}" -1 45970); do
+    printf '%s\n' "${used}" | grep -qx "${p}" && continue
+    port_busy_tcp "${p}" && continue
+    printf '%s' "${p}"
+    return 0
+  done
+  printf '%s' "${XRAY_REALITY_LOCAL}"
+}
+
+xray_mldsa65() {
+  REALITY_MLDSA_SEED=""
+  REALITY_MLDSA_VERIFY=""
+  local out
+  [[ -x "${XRAY_BIN}" ]] || return 1
+  out=$("${XRAY_BIN}" mldsa65 2>/dev/null) || return 1
+  REALITY_MLDSA_SEED=$(printf '%s\n' "${out}" | awk 'NR==1{print $NF}')
+  REALITY_MLDSA_VERIFY=$(printf '%s\n' "${out}" | awk 'NR==2{print $NF}')
+  [[ -n "${REALITY_MLDSA_SEED}" && -n "${REALITY_MLDSA_VERIFY}" ]]
+}
+
+# 与 v2ray-agent initRealityMldsa65 相同：目标支持 X25519MLKEM768 且证书链 > 3500 才生成。
+maybe_init_mldsa65() {
+  local dest="$1"
+  REALITY_MLDSA_SEED=""
+  REALITY_MLDSA_VERIFY=""
+  [[ -x "${XRAY_BIN}" ]] || return 0
+  local ping length
+  ping=$("${XRAY_BIN}" tls ping "${dest}" 2>/dev/null) || return 0
+  printf '%s\n' "${ping}" | grep -q "X25519MLKEM768" || return 0
+  length=$(printf '%s\n' "${ping}" | awk '/Certificate chain/{print $NF; exit}')
+  [[ "${length}" =~ ^[0-9]+$ && "${length}" -gt 3500 ]] || return 0
+  xray_mldsa65 || true
+}
+
+# 与 v2ray-agent checkRealityDest 相同：禁止误用 Cloudflare 代理域名。
+check_reality_dest() {
+  local host="${1%%:*}"
+  local trace
+  [[ -n "${host}" ]] || return 0
+  trace=$(curl -fsS --max-time 8 "https://${host}/cdn-cgi/trace" 2>/dev/null | grep "visit_scheme=https" || true)
+  if [[ -n "${trace}" ]]; then
+    tui_yesno "Cloudflare 警告" "检测到 ${host} 走了 Cloudflare 代理。强制使用可能导致流量被滥用。是否继续？" || return 1
+  fi
+  return 0
+}
+
+prompt_node_outbound() {
+  local title="${1:-出站}"
+  tui_menu "${title}" "与 v2ray-agent 出站条目对齐" \
+    "proxy" "默认出站（SOCKS5 / 直连）" \
+    "direct" "直连 (direct)" \
+    "z_direct_outbound" "z_direct_outbound（freedom UseIP）" \
+    "IPv4_out" "强制 IPv4" \
+    "IPv6_out" "强制 IPv6" \
+    "socks5_outbound" "socks5_outbound" \
+    "warp" "Cloudflare WARP" \
+    "blackhole_out" "黑洞"
+}
+
+prompt_network() {
+  tui_menu "传输层（对齐 3X-UI）" "选择 network / type" \
+    "tcp" "TCP / RAW（可配 Vision）" \
+    "ws" "WebSocket" \
+    "grpc" "gRPC" \
+    "httpupgrade" "HTTPUpgrade" \
+    "xhttp" "XHTTP" \
+    "kcp" "mKCP（UDP）"
+}
+
+prompt_security() {
+  local extra="${1:-}"
+  if [[ "${extra}" == "reality" ]]; then
+    tui_menu "传输安全" "选择 security" \
+      "tls" "TLS" \
+      "reality" "REALITY" \
+      "none" "无加密（仅测试 / Nginx 前置）"
+  else
+    tui_menu "传输安全" "选择 security" \
+      "tls" "TLS" \
+      "none" "无加密（仅测试 / Nginx 前置）"
+  fi
+}
+
+prompt_stream_extras() {
+  local network="$1"
+  STREAM_PATH=""
+  STREAM_HOST=""
+  STREAM_SERVICE=""
+  STREAM_MODE="auto"
+  STREAM_HEADER="none"
+  STREAM_SEED=""
+  case "${network}" in
+    ws|httpupgrade)
+      STREAM_PATH=$(tui_input "路径" "path" "/xcc") || return 1
+      STREAM_HOST=$(tui_input "Host" "Host / SNI 头" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || return 1
+      ;;
+    grpc)
+      STREAM_SERVICE=$(tui_input "gRPC" "serviceName" "grpc") || return 1
+      STREAM_PATH="${STREAM_SERVICE}"
+      ;;
+    xhttp)
+      STREAM_PATH=$(tui_input "XHTTP" "path" "/xhttp") || return 1
+      STREAM_HOST=$(tui_input "XHTTP" "host（可空）" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || return 1
+      STREAM_MODE=$(tui_menu "XHTTP mode" "对齐 3X-UI / Xray" \
+        "auto" "auto" \
+        "packet-up" "packet-up" \
+        "stream-up" "stream-up" \
+        "stream-one" "stream-one") || return 1
+      ;;
+    kcp)
+      STREAM_HEADER=$(tui_menu "mKCP 伪装" "header.type" \
+        "none" "none" \
+        "srtp" "srtp" \
+        "utp" "utp" \
+        "wechat-video" "wechat-video" \
+        "dtls" "dtls" \
+        "wireguard" "wireguard") || return 1
+      STREAM_SEED=$(tui_input "mKCP seed" "可空" "") || return 1
+      ;;
+    tcp)
+      if tui_yesno "TCP 伪装" "是否启用 HTTP header 伪装？" 1; then
+        STREAM_HEADER="http"
+        STREAM_PATH=$(tui_input "HTTP path" "path" "/") || return 1
+        STREAM_HOST=$(tui_input "HTTP Host" "Host" "$(jq -r '.settings.domain // empty' "${XCC_NODES}")") || return 1
+      fi
+      ;;
+  esac
+  return 0
+}
+
+stream_node_fields() {
+  jq -n \
+    --arg network "${1}" \
+    --arg security "${2}" \
+    --arg path "${STREAM_PATH}" \
+    --arg host "${STREAM_HOST}" \
+    --arg service_name "${STREAM_SERVICE}" \
+    --arg xhttp_mode "${STREAM_MODE}" \
+    --arg header_type "${STREAM_HEADER}" \
+    --arg seed "${STREAM_SEED}" \
+    '{
+      network:$network, security:$security, path:$path, host:$host,
+      service_name:$service_name, xhttp_mode:$xhttp_mode,
+      header_type:$header_type, seed:$seed
+    }'
 }
 
 node_email() {
@@ -2194,34 +2660,108 @@ vless_ws_share_link() {
     "${uuid}" "${ip}" "${port}" "${host}" "${sni}" "${path}" "${email}"
 }
 
+vless_share_link() {
+  local json="$1" ip uuid port sni host path email net sec flow svc mode hdr seed pbk sid q type
+  ip=$(public_ip)
+  uuid=$(printf '%s' "${json}" | jq -r '.uuid')
+  net=$(printf '%s' "${json}" | jq -r '.network // "tcp"')
+  sec=$(printf '%s' "${json}" | jq -r '.security // "tls"')
+  sni=$(printf '%s' "${json}" | jq -r '.sni // .host // empty')
+  host=$(printf '%s' "${json}" | jq -r '.host // .sni // empty')
+  path=$(printf '%s' "${json}" | jq -r '.path // empty')
+  flow=$(printf '%s' "${json}" | jq -r '.flow // empty')
+  svc=$(printf '%s' "${json}" | jq -r '.service_name // empty')
+  mode=$(printf '%s' "${json}" | jq -r '.xhttp_mode // "auto"')
+  hdr=$(printf '%s' "${json}" | jq -r '.header_type // "none"')
+  seed=$(printf '%s' "${json}" | jq -r '.seed // empty')
+  pbk=$(printf '%s' "${json}" | jq -r '.public_key // empty')
+  sid=$(printf '%s' "${json}" | jq -r --arg d "${REALITY_DEFAULT_SID}" '.short_id // $d')
+  email=$(node_email "${json}")
+  type="${net}"
+  [[ "${type}" == "kcp" ]] && type="kcp"
+  if nginx_front_enabled && [[ "${net}" == "ws" || "${net}" == "httpupgrade" ]]; then
+    port=$(nginx_public_port)
+    host=$(tls_public_host)
+    sni="${host}"
+    sec="tls"
+  else
+    port=$(printf '%s' "${json}" | jq -r '.port')
+  fi
+  q="encryption=none&security=${sec}&type=${type}"
+  [[ -n "${sni}" ]] && q+="&sni=${sni}"
+  q+="&fp=chrome"
+  case "${net}" in
+    ws|httpupgrade) q+="&host=${host}&path=$(urlencode "${path:-/}")" ;;
+    grpc) q+="&serviceName=$(urlencode "${svc:-grpc}")&mode=gun" ;;
+    xhttp) q+="&path=$(urlencode "${path:-/xhttp}")&mode=${mode}"; [[ -n "${host}" ]] && q+="&host=${host}" ;;
+    kcp) q+="&headerType=${hdr}"; [[ -n "${seed}" ]] && q+="&seed=$(urlencode "${seed}")" ;;
+    tcp) q+="&headerType=${hdr}"; [[ -n "${host}" && "${hdr}" == "http" ]] && q+="&host=${host}&path=$(urlencode "${path:-/}")" ;;
+  esac
+  if [[ "${sec}" == "reality" ]]; then
+    q+="&pbk=${pbk}&sid=${sid}"
+  fi
+  [[ -n "${flow}" && "${net}" == "tcp" ]] && q+="&flow=${flow}"
+  printf 'vless://%s@%s:%s?%s#%s\n' "${uuid}" "${ip}" "${port}" "${q}" "${email}"
+}
+
 vmess_share_link() {
-  local json="$1" ip payload email port
+  local json="$1" ip payload email port net
   ip=$(public_ip)
   email=$(node_email "${json}")
-  if nginx_front_enabled; then
+  net=$(printf '%s' "${json}" | jq -r '.network // "ws"')
+  if nginx_front_enabled && [[ "${net}" == "ws" || "${net}" == "httpupgrade" ]]; then
     port=$(nginx_public_port)
   else
     port=$(printf '%s' "${json}" | jq -r '.port')
   fi
-  payload=$(printf '%s' "${json}" | jq -c --arg ip "${ip}" --arg ps "${email}" --argjson port "${port}" '{
+  payload=$(printf '%s' "${json}" | jq -c --arg ip "${ip}" --arg ps "${email}" --argjson port "${port}" --arg net "${net}" '
+    {
       v:2, ps:$ps, add:$ip, port:$port,
-      id:.uuid, aid:0, tls:"tls", host:(.host // .sni // ""),
-      type:"none", path:(.path // "/xcc"), net:(.network // "ws"),
+      id:.uuid, aid:0,
+      tls:(if (.security // "tls") == "none" then "" else (.security // "tls") end),
+      host:(.host // .sni // ""),
+      type:(if $net == "grpc" then "gun" elif $net == "kcp" then (.header_type // "none") else "none" end),
+      path:(if $net == "grpc" then (.service_name // .path // "grpc") else (.path // "/xcc") end),
+      net:$net,
       method:"none", peer:(.sni // .host // ""), sni:(.sni // .host // "")
     }')
   printf 'vmess://%s\n' "$(printf '%s' "${payload}" | base64 -w0 2>/dev/null || printf '%s' "${payload}" | base64)"
 }
 
 trojan_share_link() {
-  local json="$1" ip port sni pass email host
+  local json="$1" ip port sni pass email host net sec path q
   ip=$(public_ip)
-  port=$(printf '%s' "${json}" | jq -r '.port')
-  sni=$(printf '%s' "${json}" | jq -r '.sni // empty')
+  net=$(printf '%s' "${json}" | jq -r '.network // "tcp"')
+  sec=$(printf '%s' "${json}" | jq -r '.security // "tls"')
+  sni=$(printf '%s' "${json}" | jq -r '.sni // .host // empty')
   pass=$(printf '%s' "${json}" | jq -r '.password')
+  path=$(printf '%s' "${json}" | jq -r '.path // empty')
   email=$(node_email "${json}")
+  if nginx_front_enabled && [[ "${net}" == "ws" || "${net}" == "httpupgrade" ]]; then
+    port=$(nginx_public_port)
+    sni=$(tls_public_host)
+    sec="tls"
+  else
+    port=$(printf '%s' "${json}" | jq -r '.port')
+  fi
   host="${sni:-${ip}}"
-  printf 'trojan://%s@%s:%s?peer=%s&fp=chrome&sni=%s&alpn=http/1.1#%s_Trojan\n' \
-    "${pass}" "${host}" "${port}" "${host}" "${host}" "${email}"
+  if [[ "${net}" == "tcp" && "${sec}" == "tls" ]]; then
+    printf 'trojan://%s@%s:%s?peer=%s&fp=chrome&sni=%s&alpn=http/1.1#%s_Trojan\n' \
+      "${pass}" "${host}" "${port}" "${host}" "${host}" "${email}"
+    return 0
+  fi
+  q="security=${sec}&type=${net}&fp=chrome&sni=${host}"
+  [[ -n "${path}" ]] && q+="&path=$(urlencode "${path}")"
+  if [[ "${net}" == "grpc" ]]; then
+    local svc
+    svc=$(printf '%s' "${json}" | jq -r '.service_name // "grpc"')
+    q+="&serviceName=$(urlencode "${svc}")"
+  fi
+  if [[ "${sec}" == "reality" ]]; then
+    q+="&pbk=$(printf '%s' "${json}" | jq -r '.public_key // empty')"
+    q+="&sid=$(printf '%s' "${json}" | jq -r --arg d "${REALITY_DEFAULT_SID}" '.short_id // $d')"
+  fi
+  printf 'trojan://%s@%s:%s?%s#%s\n' "${pass}" "${host}" "${port}" "${q}" "${email}"
 }
 
 ss_share_link() {
@@ -2234,22 +2774,67 @@ ss_share_link() {
   printf 'ss://%s@%s:%s#xcc-ss-%s\n' "${userinfo}" "${ip}" "${port}" "${port}"
 }
 
+http_share_link() {
+  local json="$1" ip port user pass
+  ip=$(public_ip)
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  user=$(printf '%s' "${json}" | jq -r '.username // empty')
+  pass=$(printf '%s' "${json}" | jq -r '.password // empty')
+  if [[ -n "${user}" ]]; then
+    printf 'http://%s:%s@%s:%s\n' "${user}" "${pass}" "${ip}" "${port}"
+  else
+    printf 'http://%s:%s\n' "${ip}" "${port}"
+  fi
+}
+
+socks_share_link() {
+  local json="$1" ip port user pass
+  ip=$(public_ip)
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  user=$(printf '%s' "${json}" | jq -r '.username // empty')
+  pass=$(printf '%s' "${json}" | jq -r '.password // empty')
+  if [[ -n "${user}" ]]; then
+    printf 'socks5://%s:%s@%s:%s\n' "${user}" "${pass}" "${ip}" "${port}"
+  else
+    printf 'socks5://%s:%s\n' "${ip}" "${port}"
+  fi
+}
+
+wg_share_link() {
+  local json="$1" ip port
+  ip=$(public_ip)
+  port=$(printf '%s' "${json}" | jq -r '.port')
+  printf '%s\n' "${json}" | jq -r --arg ip "${ip}" --argjson port "${port}" '
+    "[Interface]\nPrivateKey = \(.client_private_key)\nAddress = \(.client_address // "10.0.0.2/32")\nDNS = 1.1.1.1\nMTU = \(.mtu // 1420)\n\n[Peer]\nPublicKey = \(.public_key)\nAllowedIPs = 0.0.0.0/0, ::/0\nEndpoint = \($ip):\($port)"
+  '
+}
+
+tunnel_share_link() {
+  local json="$1"
+  printf '%s\n' "${json}" | jq -r '"dokodemo-door \(.port) -> \(.target_address):\(.target_port) (\(.network // "tcp,udp"))"'
+}
+
 node_share_link() {
   local kind="$1" json="$2"
   case "${kind}" in
     reality) reality_share_link "${json}" ;;
     hysteria) hysteria_share_link "${json}" ;;
     vless_ws) vless_ws_share_link "${json}" ;;
+    vless) vless_share_link "${json}" ;;
     vmess) vmess_share_link "${json}" ;;
     trojan) trojan_share_link "${json}" ;;
     shadowsocks) ss_share_link "${json}" ;;
+    wireguard) wg_share_link "${json}" ;;
+    http) http_share_link "${json}" ;;
+    socks) socks_share_link "${json}" ;;
+    tunnel) tunnel_share_link "${json}" ;;
   esac
 }
 
 collect_all_links() {
   local kind json
   migrate_nodes_json
-  for kind in reality vless_ws vmess trojan shadowsocks hysteria; do
+  for kind in reality vless_ws vless vmess trojan shadowsocks hysteria wireguard http socks tunnel; do
     while IFS= read -r json; do
       [[ -n "${json}" ]] || continue
       node_share_link "${kind}" "${json}"
@@ -2373,7 +2958,36 @@ write_clash_proxies() {
       echo "      headers:"
       echo "        Host: ${host}"
     } >> "${file}"
-  done < <(jq -c '.vmess[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+  done < <(jq -c '.vmess[]? | select(.enabled==true and ((.network // "ws") == "ws" or (.network // "") == "httpupgrade"))' "${XCC_NODES}" 2>/dev/null)
+
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    email=$(node_email "${json}")
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    net=$(printf '%s' "${json}" | jq -r '.network // "tcp"')
+    sec=$(printf '%s' "${json}" | jq -r '.security // "tls"')
+    printf '%s\n' "${email}" >> "${names_file}"
+    {
+      echo "  - name: $(yaml_quote "${email}")"
+      echo "    type: vmess"
+      echo "    server: ${ip}"
+      echo "    port: ${port}"
+      echo "    uuid: $(printf '%s' "${json}" | jq -r '.uuid')"
+      echo "    alterId: 0"
+      echo "    cipher: auto"
+      echo "    udp: true"
+      echo "    network: ${net}"
+      if [[ "${sec}" == "tls" ]]; then
+        echo "    tls: true"
+        echo "    servername: $(printf '%s' "${json}" | jq -r '.sni // .host // empty')"
+        echo "    client-fingerprint: chrome"
+      fi
+      if [[ "${net}" == "grpc" ]]; then
+        echo "    grpc-opts:"
+        echo "      grpc-service-name: $(printf '%s' "${json}" | jq -r '.service_name // .path // "grpc"')"
+      fi
+    } >> "${file}"
+  done < <(jq -c '.vmess[]? | select(.enabled==true and ((.network // "ws") != "ws") and ((.network // "") != "httpupgrade"))' "${XCC_NODES}" 2>/dev/null)
 
   while IFS= read -r json; do
     [[ -n "${json}" ]] || continue
@@ -2394,7 +3008,52 @@ write_clash_proxies() {
       echo "      - http/1.1"
       echo "    client-fingerprint: chrome"
     } >> "${file}"
-  done < <(jq -c '.trojan[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+  done < <(jq -c '.trojan[]? | select(.enabled==true and (.network // "tcp") == "tcp" and (.security // "tls") == "tls")' "${XCC_NODES}" 2>/dev/null)
+
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    email=$(node_email "${json}")
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    net=$(printf '%s' "${json}" | jq -r '.network // "tcp"')
+    sec=$(printf '%s' "${json}" | jq -r '.security // "tls"')
+    host=$(printf '%s' "${json}" | jq -r '.sni // .host // empty')
+    [[ -n "${host}" ]] || host="${ip}"
+    if nginx_front_enabled && [[ "${net}" == "ws" || "${net}" == "httpupgrade" ]]; then
+      port=$(nginx_public_port)
+      host=$(tls_public_host)
+      sec="tls"
+    fi
+    printf '%s\n' "${email}" >> "${names_file}"
+    {
+      echo "  - name: $(yaml_quote "${email}")"
+      echo "    type: trojan"
+      echo "    server: ${ip}"
+      echo "    port: ${port}"
+      echo "    password: $(printf '%s' "${json}" | jq -r '.password')"
+      echo "    udp: true"
+      echo "    sni: ${host}"
+      echo "    network: ${net}"
+      echo "    client-fingerprint: chrome"
+      if [[ "${sec}" == "tls" || "${sec}" == "reality" ]]; then
+        echo "    skip-cert-verify: false"
+      fi
+      if [[ "${sec}" == "reality" ]]; then
+        echo "    reality-opts:"
+        echo "      public-key: $(printf '%s' "${json}" | jq -r '.public_key')"
+        echo "      short-id: $(printf '%s' "${json}" | jq -r --arg d "${REALITY_DEFAULT_SID}" '.short_id // $d')"
+      fi
+      if [[ "${net}" == "grpc" ]]; then
+        echo "    grpc-opts:"
+        echo "      grpc-service-name: $(printf '%s' "${json}" | jq -r '.service_name // .path // "grpc"')"
+      fi
+      if [[ "${net}" == "ws" || "${net}" == "httpupgrade" ]]; then
+        echo "    ws-opts:"
+        echo "      path: $(printf '%s' "${json}" | jq -r '.path // "/xcc"')"
+        echo "      headers:"
+        echo "        Host: ${host}"
+      fi
+    } >> "${file}"
+  done < <(jq -c '.trojan[]? | select(.enabled==true and ((.network // "tcp") != "tcp" or (.security // "tls") != "tls"))' "${XCC_NODES}" 2>/dev/null)
 
   while IFS= read -r json; do
     [[ -n "${json}" ]] || continue
@@ -2402,8 +3061,8 @@ write_clash_proxies() {
     port=$(printf '%s' "${json}" | jq -r '.port')
     host=$(printf '%s' "${json}" | jq -r '.sni // .domain // empty')
     insecure=$(printf '%s' "${json}" | jq -r '.insecure // true')
-    up=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_DOWN_MBPS}" '.down_mbps // $d')
-    down=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_UP_MBPS}" '.up_mbps // $d')
+    up=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_UP_MBPS}" '.up_mbps // $d')
+    down=$(printf '%s' "${json}" | jq -r --argjson d "${HYSTERIA_DEFAULT_DOWN_MBPS}" '.down_mbps // $d')
     obfs=$(printf '%s' "${json}" | jq -r '.obfs // empty')
     [[ -n "${host}" && "${host}" != "localhost" ]] || host="${ip}"
     printf '%s\n' "${email}" >> "${names_file}"
@@ -2427,6 +3086,127 @@ write_clash_proxies() {
       fi
     } >> "${file}"
   done < <(jq -c '.hysteria[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    email=$(node_email "${json}")
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    host="${ip}"
+    net=$(printf '%s' "${json}" | jq -r '.network // "tcp"')
+    sec=$(printf '%s' "${json}" | jq -r '.security // "tls"')
+    if nginx_front_enabled && [[ "${net}" == "ws" || "${net}" == "httpupgrade" ]]; then
+      port=$(nginx_public_port)
+      host=$(tls_public_host)
+      sec="tls"
+    fi
+    printf '%s\n' "${email}" >> "${names_file}"
+    {
+      echo "  - name: $(yaml_quote "${email}")"
+      echo "    type: vless"
+      echo "    server: ${ip}"
+      echo "    port: ${port}"
+      echo "    uuid: $(printf '%s' "${json}" | jq -r '.uuid')"
+      echo "    udp: true"
+      echo "    network: ${net}"
+      if [[ "${sec}" == "tls" || "${sec}" == "reality" ]]; then
+        echo "    tls: true"
+        echo "    servername: $(printf '%s' "${json}" | jq -r '.sni // .host // empty')"
+        echo "    client-fingerprint: chrome"
+      fi
+      if [[ "${sec}" == "reality" ]]; then
+        echo "    reality-opts:"
+        echo "      public-key: $(printf '%s' "${json}" | jq -r '.public_key')"
+        echo "      short-id: $(printf '%s' "${json}" | jq -r --arg d "${REALITY_DEFAULT_SID}" '.short_id // $d')"
+      fi
+      flow=$(printf '%s' "${json}" | jq -r '.flow // empty')
+      [[ -n "${flow}" && "${net}" == "tcp" ]] && echo "    flow: ${flow}"
+      case "${net}" in
+        ws|httpupgrade)
+          echo "    ws-opts:"
+          echo "      path: $(printf '%s' "${json}" | jq -r '.path // "/xcc"')"
+          echo "      headers:"
+          echo "        Host: $(printf '%s' "${json}" | jq -r '.host // .sni // empty')"
+          ;;
+        grpc)
+          echo "    grpc-opts:"
+          echo "      grpc-service-name: $(printf '%s' "${json}" | jq -r '.service_name // "grpc"')"
+          ;;
+        xhttp)
+          echo "    smux:"
+          echo "      enabled: false"
+          ;;
+      esac
+    } >> "${file}"
+  done < <(jq -c '.vless[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    email=$(node_email "${json}")
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    printf '%s\n' "${email}" >> "${names_file}"
+    {
+      echo "  - name: $(yaml_quote "${email}")"
+      echo "    type: ss"
+      echo "    server: ${ip}"
+      echo "    port: ${port}"
+      echo "    cipher: $(printf '%s' "${json}" | jq -r '.method // "2022-blake3-aes-128-gcm"')"
+      echo "    password: $(printf '%s' "${json}" | jq -r '.password')"
+      echo "    udp: true"
+    } >> "${file}"
+  done < <(jq -c '.shadowsocks[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    email=$(node_email "${json}")
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    printf '%s\n' "${email}" >> "${names_file}"
+    {
+      echo "  - name: $(yaml_quote "${email}")"
+      echo "    type: http"
+      echo "    server: ${ip}"
+      echo "    port: ${port}"
+      if [[ "$(printf '%s' "${json}" | jq -r '.username // empty')" != "" ]]; then
+        echo "    username: $(printf '%s' "${json}" | jq -r '.username')"
+        echo "    password: $(printf '%s' "${json}" | jq -r '.password')"
+      fi
+    } >> "${file}"
+  done < <(jq -c '.http[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    email=$(node_email "${json}")
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    printf '%s\n' "${email}" >> "${names_file}"
+    {
+      echo "  - name: $(yaml_quote "${email}")"
+      echo "    type: socks5"
+      echo "    server: ${ip}"
+      echo "    port: ${port}"
+      echo "    udp: true"
+      if [[ "$(printf '%s' "${json}" | jq -r '.username // empty')" != "" ]]; then
+        echo "    username: $(printf '%s' "${json}" | jq -r '.username')"
+        echo "    password: $(printf '%s' "${json}" | jq -r '.password')"
+      fi
+    } >> "${file}"
+  done < <(jq -c '.socks[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
+
+  while IFS= read -r json; do
+    [[ -n "${json}" ]] || continue
+    email=$(node_email "${json}")
+    port=$(printf '%s' "${json}" | jq -r '.port')
+    printf '%s\n' "${email}" >> "${names_file}"
+    {
+      echo "  - name: $(yaml_quote "${email}")"
+      echo "    type: wireguard"
+      echo "    server: ${ip}"
+      echo "    port: ${port}"
+      echo "    private-key: $(printf '%s' "${json}" | jq -r '.client_private_key')"
+      echo "    ip: $(printf '%s' "${json}" | jq -r '.client_address // "10.0.0.2/32"' | cut -d/ -f1)"
+      echo "    public-key: $(printf '%s' "${json}" | jq -r '.public_key')"
+      echo "    udp: true"
+      echo "    mtu: $(printf '%s' "${json}" | jq -r '.mtu // 1420')"
+    } >> "${file}"
+  done < <(jq -c '.wireguard[]? | select(.enabled==true)' "${XCC_NODES}" 2>/dev/null)
 }
 
 write_clash_subscribe() {
@@ -2565,7 +3345,8 @@ menu_dashboard() {
     jq -r '
       def line($k):
         (.[$k][]? | "  \($k)\t\(.tag)\tport=\(.port)\t\(if .enabled then "启用" else "禁用" end)\tout=\(.outbound // "proxy")");
-      line("reality"), line("vless_ws"), line("vmess"), line("trojan"), line("shadowsocks"), line("hysteria")
+      line("reality"), line("vless_ws"), line("vless"), line("vmess"), line("trojan"), line("shadowsocks"),
+      line("hysteria"), line("wireguard"), line("http"), line("socks"), line("tunnel")
     ' "${XCC_NODES}" 2>/dev/null || true
     echo
     echo "----- 流量 (Xray Stats API) -----"
@@ -2761,11 +3542,12 @@ menu_warp() {
 menu_routing() {
   local choice cur
   migrate_nodes_json
-  choice=$(tui_menu "分流规则" "参考 v2ray-agent：BT 阻断 / 广告 / CN 直连 / 域名黑名单" \
+  choice=$(tui_menu "分流规则" "参考 v2ray-agent：BT 阻断 / 广告 / CN 直连 / 域名黑名单 / IPv6 出站" \
     "bt" "切换 BT/P2P 阻断" \
     "ads" "切换广告拦截 (geosite:category-ads-all)" \
     "cn" "切换国内直连 (geoip/geosite:cn)" \
-    "blk" "编辑域名黑名单（逗号分隔）") || return 0
+    "blk" "编辑域名黑名单（逗号分隔）" \
+    "v6" "编辑 IPv6 出站域名（走 IPv6_out）") || return 0
   begin_config_op
   case "${choice}" in
     bt)
@@ -2785,6 +3567,13 @@ menu_routing() {
       cur=$(tui_input "域名黑名单" "逗号分隔，如 geosite:google,domain:example.com" "${cur}") || { end_config_op_cancel; return 1; }
       jq_apply "${XCC_NODES}" --arg s "${cur}" \
         '.settings.domain_block = ($s | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(. != "")))' \
+        || { end_config_op_fail; return 1; }
+      ;;
+    v6)
+      cur=$(jq -r '(.settings.ipv6_domains // []) | join(",")' "${XCC_NODES}")
+      cur=$(tui_input "IPv6 出站" "逗号分隔域名，走 IPv6_out（ForceIPv6）" "${cur}") || { end_config_op_cancel; return 1; }
+      jq_apply "${XCC_NODES}" --arg s "${cur}" \
+        '.settings.ipv6_domains = ($s | split(",") | map(gsub("^\\s+|\\s+$";"")) | map(select(. != "")))' \
         || { end_config_op_fail; return 1; }
       ;;
   esac
@@ -2830,7 +3619,7 @@ menu_core_update() {
 }
 
 menu_quick_reality() {
-  local port=443 uuid tag short_id node
+  local port=443 uuid tag short_id node xport dest
   begin_config_op
   if ! assert_port_free "${port}"; then
     port=$(tui_input "一键 Reality" "443 已被占用，请换端口" "8443") || { end_config_op_cancel; return 1; }
@@ -2839,24 +3628,28 @@ menu_quick_reality() {
   if ! xray_x25519; then
     tui_msg "错误" "x25519 失败"; end_config_op_fail; return 1
   fi
+  dest="${REALITY_DEFAULT_SNI}:443"
+  maybe_init_mldsa65 "${dest}"
   uuid=$(xray_uuid)
   tag="reality-${port}"
   short_id="${REALITY_DEFAULT_SID}"
-  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg uuid "${uuid}" \
+  xport=$(alloc_reality_local_port)
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --argjson xray_port "${xport}" --arg uuid "${uuid}" \
     --arg private_key "${REALITY_PRIV}" --arg public_key "${REALITY_PUB}" --arg short_id "${short_id}" \
-    --arg sni "${REALITY_DEFAULT_SNI}" --arg dest "${REALITY_DEFAULT_SNI}:443" \
+    --arg sni "${REALITY_DEFAULT_SNI}" --arg dest "${dest}" \
     --arg email "${tag}" \
+    --arg mldsa_seed "${REALITY_MLDSA_SEED:-}" --arg mldsa_verify "${REALITY_MLDSA_VERIFY:-}" \
     '{
-      tag:$tag, enabled:true, port:$port, uuid:$uuid, email:$email,
+      tag:$tag, enabled:true, port:$port, xray_port:$xray_port, uuid:$uuid, email:$email,
       private_key:$private_key, public_key:$public_key,
       sni:$sni, dest:$dest, domain:$sni,
       flow:"xtls-rprx-vision", fingerprint:"chrome", tls:"1.3", short_id:$short_id, outbound:"proxy"
-    }')
+    } + (if $mldsa_seed == "" then {} else {mldsa65_seed:$mldsa_seed, mldsa65_verify:$mldsa_verify} end)')
   upsert_node reality "${node}"
   fw_allow_tcp "${port}"
   if apply_xray_config; then
     end_config_op_ok
-    show_share_and_qr "一键 Reality 完成（无域名 / mozilla 伪装，与 v2ray-agent 相同 sid）" "$(reality_share_link "${node}")"
+    show_share_and_qr "一键 Reality 完成（dokodemo→127.0.0.1:${xport} / mozilla 伪装，与 v2ray-agent 相同）" "$(reality_share_link "${node}")"
   else
     end_config_op_fail
   fi
@@ -2937,20 +3730,301 @@ menu_config_trojan() {
 }
 
 menu_config_ss() {
-  local port pass tag node
+  local port pass tag node method
   begin_config_op
-  port=$(tui_input "Shadowsocks 2022" "端口" "40000") || { end_config_op_cancel; return 1; }
+  method=$(tui_menu "Shadowsocks 加密" "对齐 3X-UI 常用 method" \
+    "2022-blake3-aes-128-gcm" "2022-blake3-aes-128-gcm" \
+    "2022-blake3-aes-256-gcm" "2022-blake3-aes-256-gcm" \
+    "2022-blake3-chacha20-poly1305" "2022-blake3-chacha20-poly1305" \
+    "aes-128-gcm" "aes-128-gcm" \
+    "aes-256-gcm" "aes-256-gcm" \
+    "chacha20-ietf-poly1305" "chacha20-ietf-poly1305") || { end_config_op_cancel; return 1; }
+  port=$(tui_input "Shadowsocks" "端口" "40000") || { end_config_op_cancel; return 1; }
   assert_port_free "${port}" || { end_config_op_cancel; return 1; }
-  pass=$(openssl rand -base64 16 | tr -d '\n')
+  case "${method}" in
+    2022-blake3-aes-256-gcm|2022-blake3-chacha20-poly1305) pass=$(openssl rand -base64 32 | tr -d '\n') ;;
+    2022-blake3-aes-128-gcm) pass=$(openssl rand -base64 16 | tr -d '\n') ;;
+    *) pass=$(rand_alnum 16) ;;
+  esac
   tag="ss-${port}"
-  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg password "${pass}" \
-    '{tag:$tag,enabled:true,port:$port,password:$password,method:"2022-blake3-aes-128-gcm",outbound:"proxy"}')
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg password "${pass}" --arg method "${method}" \
+    '{tag:$tag,enabled:true,port:$port,password:$password,method:$method,outbound:"proxy"}')
   upsert_node shadowsocks "${node}"
   fw_allow_tcp "${port}"
   fw_allow_udp "${port}"
   if apply_xray_config; then
     end_config_op_ok
-    show_share_and_qr "Shadowsocks 2022 已创建" "$(ss_share_link "${node}")"
+    show_share_and_qr "Shadowsocks 已创建" "$(ss_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_more_protocols() {
+  local choice
+  choice=$(tui_menu "更多协议（3X-UI 覆盖）" "VLESS/VMess/Trojan 全传输 + WG / HTTP / SOCKS / Tunnel" \
+    "vless" "VLESS（TCP/gRPC/XHTTP/HTTPUpgrade/mKCP）" \
+    "vmess" "VMess（全传输）" \
+    "trojan" "Trojan（全传输 / REALITY）" \
+    "wg" "WireGuard 入站" \
+    "http" "HTTP 入站" \
+    "socks" "SOCKS5 / Mixed 入站" \
+    "tunnel" "Tunnel（dokodemo-door）") || return 0
+  case "${choice}" in
+    vless) menu_config_vless_full ;;
+    vmess) menu_config_vmess_full ;;
+    trojan) menu_config_trojan_full ;;
+    wg) menu_config_wireguard ;;
+    http) menu_config_http ;;
+    socks) menu_config_socks ;;
+    tunnel) menu_config_tunnel ;;
+  esac
+}
+
+menu_config_vless_full() {
+  local port network security domain uuid tag node flow xport extra
+  begin_config_op
+  network=$(prompt_network) || { end_config_op_cancel; return 1; }
+  if [[ "${network}" == "kcp" ]]; then
+    security="none"
+  else
+    security=$(prompt_security reality) || { end_config_op_cancel; return 1; }
+  fi
+  port=$(tui_input "VLESS" "监听端口" "$( [[ "${network}" == "kcp" ]] && echo 20000 || echo 8443 )") || { end_config_op_cancel; return 1; }
+  if [[ "${network}" == "kcp" ]]; then
+    assert_udp_port_free "${port}" || { end_config_op_cancel; return 1; }
+  elif [[ "${security}" == "tls" && ( "${network}" == "ws" || "${network}" == "httpupgrade" ) ]]; then
+    assert_nginx_listen_port "${port}" || { end_config_op_cancel; return 1; }
+    jq_apply "${XCC_NODES}" --argjson p "${port}" '.settings.nginx_port = $p' || true
+  else
+    assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  fi
+  prompt_stream_extras "${network}" || { end_config_op_cancel; return 1; }
+  extra=$(stream_node_fields "${network}" "${security}")
+  domain=$(jq -r '.settings.domain // empty' "${XCC_NODES}")
+  flow=""
+  if [[ "${security}" == "tls" ]]; then
+    domain=$(tui_input "TLS" "域名 / SNI" "${domain}") || { end_config_op_cancel; return 1; }
+    prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  elif [[ "${security}" == "reality" ]]; then
+    domain=$(tui_input "REALITY" "SNI / 伪装域名" "${REALITY_DEFAULT_SNI}") || { end_config_op_cancel; return 1; }
+    if ! xray_x25519; then tui_msg "错误" "x25519 失败"; end_config_op_fail; return 1; fi
+  fi
+  if [[ "${network}" == "tcp" && ( "${security}" == "tls" || "${security}" == "reality" ) ]]; then
+    if tui_yesno "Vision" "是否启用 flow=xtls-rprx-vision？"; then
+      flow="xtls-rprx-vision"
+    fi
+  fi
+  xport=$(alloc_xray_local_port)
+  uuid=$(xray_uuid)
+  tag="vless-${network}-${port}"
+  node=$(jq -n --argjson extra "${extra}" --arg tag "${tag}" --argjson port "${port}" --argjson xray_port "${xport}" \
+    --arg uuid "${uuid}" --arg sni "${domain}" --arg flow "${flow}" \
+    --arg cert "${CERT_FILE:-}" --arg key "${KEY_FILE:-}" \
+    --arg private_key "${REALITY_PRIV:-}" --arg public_key "${REALITY_PUB:-}" \
+    --arg dest "${domain}:443" --arg short_id "${REALITY_DEFAULT_SID}" \
+    '$extra + {
+      tag:$tag, enabled:true, port:$port, xray_port:$xray_port, uuid:$uuid,
+      sni:$sni, flow:$flow, cert:$cert, key:$key, email:$tag, outbound:"proxy",
+      private_key:$private_key, public_key:$public_key, dest:$dest, short_id:$short_id
+    }')
+  upsert_node vless "${node}"
+  [[ "${network}" == "kcp" ]] && fw_allow_udp "${port}" || fw_allow_tcp "${port}"
+  if apply_all_configs; then
+    end_config_op_ok
+    show_share_and_qr "VLESS ${network}/${security} 已创建" "$(vless_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_vmess_full() {
+  local port network security domain uuid tag node xport extra
+  begin_config_op
+  network=$(prompt_network) || { end_config_op_cancel; return 1; }
+  if [[ "${network}" == "kcp" ]]; then security="none"; else
+    security=$(prompt_security) || { end_config_op_cancel; return 1; }
+  fi
+  port=$(tui_input "VMess" "监听端口" "8444") || { end_config_op_cancel; return 1; }
+  if [[ "${network}" == "kcp" ]]; then
+    assert_udp_port_free "${port}" || { end_config_op_cancel; return 1; }
+  elif [[ "${security}" == "tls" && ( "${network}" == "ws" || "${network}" == "httpupgrade" ) ]]; then
+    assert_nginx_listen_port "${port}" || { end_config_op_cancel; return 1; }
+    jq_apply "${XCC_NODES}" --argjson p "${port}" '.settings.nginx_port = $p' || true
+  else
+    assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  fi
+  prompt_stream_extras "${network}" || { end_config_op_cancel; return 1; }
+  extra=$(stream_node_fields "${network}" "${security}")
+  domain=$(jq -r '.settings.domain // empty' "${XCC_NODES}")
+  if [[ "${security}" == "tls" ]]; then
+    domain=$(tui_input "TLS" "域名 / SNI" "${domain}") || { end_config_op_cancel; return 1; }
+    prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  fi
+  xport=$(alloc_xray_local_port)
+  uuid=$(xray_uuid)
+  tag="vmess-${network}-${port}"
+  node=$(jq -n --argjson extra "${extra}" --arg tag "${tag}" --argjson port "${port}" --argjson xray_port "${xport}" \
+    --arg uuid "${uuid}" --arg sni "${domain}" --arg cert "${CERT_FILE:-}" --arg key "${KEY_FILE:-}" \
+    '$extra + {tag:$tag,enabled:true,port:$port,xray_port:$xray_port,uuid:$uuid,sni:$sni,cert:$cert,key:$key,email:$tag,outbound:"proxy"}')
+  upsert_node vmess "${node}"
+  [[ "${network}" == "kcp" ]] && fw_allow_udp "${port}" || fw_allow_tcp "${port}"
+  if apply_all_configs; then
+    end_config_op_ok
+    show_share_and_qr "VMess ${network}/${security} 已创建" "$(vmess_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_trojan_full() {
+  local port network security domain pass tag node xport extra
+  begin_config_op
+  network=$(prompt_network) || { end_config_op_cancel; return 1; }
+  if [[ "${network}" == "kcp" ]]; then security="none"; else
+    security=$(prompt_security reality) || { end_config_op_cancel; return 1; }
+  fi
+  port=$(tui_input "Trojan" "监听端口" "8445") || { end_config_op_cancel; return 1; }
+  if [[ "${network}" == "kcp" ]]; then
+    assert_udp_port_free "${port}" || { end_config_op_cancel; return 1; }
+  elif [[ "${security}" == "tls" && ( "${network}" == "ws" || "${network}" == "httpupgrade" ) ]]; then
+    assert_nginx_listen_port "${port}" || { end_config_op_cancel; return 1; }
+    jq_apply "${XCC_NODES}" --argjson p "${port}" '.settings.nginx_port = $p' || true
+  else
+    assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  fi
+  prompt_stream_extras "${network}" || { end_config_op_cancel; return 1; }
+  extra=$(stream_node_fields "${network}" "${security}")
+  pass=$(tui_input "Trojan" "密码" "$(rand_alnum 16)") || { end_config_op_cancel; return 1; }
+  domain=$(jq -r '.settings.domain // empty' "${XCC_NODES}")
+  if [[ "${security}" == "tls" ]]; then
+    domain=$(tui_input "TLS" "域名 / SNI" "${domain}") || { end_config_op_cancel; return 1; }
+    prompt_tls_files "${domain}" || { end_config_op_cancel; return 1; }
+  elif [[ "${security}" == "reality" ]]; then
+    domain=$(tui_input "REALITY" "SNI / 伪装域名" "${REALITY_DEFAULT_SNI}") || { end_config_op_cancel; return 1; }
+    if ! xray_x25519; then tui_msg "错误" "x25519 失败"; end_config_op_fail; return 1; fi
+  fi
+  xport=$(alloc_xray_local_port)
+  tag="trojan-${network}-${port}"
+  node=$(jq -n --argjson extra "${extra}" --arg tag "${tag}" --argjson port "${port}" --argjson xray_port "${xport}" \
+    --arg password "${pass}" --arg sni "${domain}" --arg cert "${CERT_FILE:-}" --arg key "${KEY_FILE:-}" \
+    --arg private_key "${REALITY_PRIV:-}" --arg public_key "${REALITY_PUB:-}" \
+    --arg dest "${domain}:443" --arg short_id "${REALITY_DEFAULT_SID}" \
+    '$extra + {
+      tag:$tag, enabled:true, port:$port, xray_port:$xray_port, password:$password,
+      sni:$sni, cert:$cert, key:$key, email:$tag, outbound:"proxy",
+      private_key:$private_key, public_key:$public_key, dest:$dest, short_id:$short_id
+    }')
+  upsert_node trojan "${node}"
+  [[ "${network}" == "kcp" ]] && fw_allow_udp "${port}" || fw_allow_tcp "${port}"
+  if apply_all_configs; then
+    end_config_op_ok
+    show_share_and_qr "Trojan ${network}/${security} 已创建" "$(trojan_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_wireguard() {
+  local port tag node srv_priv srv_pub cli_priv cli_pub
+  begin_config_op
+  port=$(tui_input "WireGuard" "UDP 端口" "51820") || { end_config_op_cancel; return 1; }
+  assert_udp_port_free "${port}" || { end_config_op_cancel; return 1; }
+  if ! xray_x25519; then tui_msg "错误" "生成服务端密钥失败"; end_config_op_fail; return 1; fi
+  srv_priv="${REALITY_PRIV}"
+  srv_pub="${REALITY_PUB}"
+  if ! xray_x25519; then tui_msg "错误" "生成客户端密钥失败"; end_config_op_fail; return 1; fi
+  cli_priv="${REALITY_PRIV}"
+  cli_pub="${REALITY_PUB}"
+  tag="wg-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" \
+    --arg private_key "${srv_priv}" --arg public_key "${srv_pub}" \
+    --arg client_private_key "${cli_priv}" --arg client_public_key "${cli_pub}" \
+    '{
+      tag:$tag, enabled:true, port:$port, email:$tag, outbound:"proxy",
+      private_key:$private_key, public_key:$public_key,
+      client_private_key:$client_private_key, client_public_key:$client_public_key,
+      address:"10.0.0.1/24", client_address:"10.0.0.2/32", mtu:1420
+    }')
+  upsert_node wireguard "${node}"
+  fw_allow_udp "${port}"
+  if apply_xray_config; then
+    end_config_op_ok
+    show_share_and_qr "WireGuard 入站已创建（客户端配置）" "$(wg_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_http() {
+  local port user pass tag node
+  begin_config_op
+  port=$(tui_input "HTTP 入站" "端口" "10809") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  user=$(tui_input "HTTP 入站" "用户名（可空=无认证）" "") || { end_config_op_cancel; return 1; }
+  pass=""
+  [[ -n "${user}" ]] && { pass=$(tui_password "HTTP 入站" "密码" "") || { end_config_op_cancel; return 1; }; }
+  tag="http-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg username "${user}" --arg password "${pass}" \
+    '{tag:$tag,enabled:true,port:$port,username:$username,password:$password,email:$tag,outbound:"proxy"}')
+  upsert_node http "${node}"
+  fw_allow_tcp "${port}"
+  if apply_xray_config; then
+    end_config_op_ok
+    show_share_and_qr "HTTP 入站已创建" "$(http_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_socks() {
+  local port user pass tag node
+  begin_config_op
+  port=$(tui_input "SOCKS5 入站" "端口（UDP 一并开启，相当于 3X-UI Mixed）" "10808") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  user=$(tui_input "SOCKS5 入站" "用户名（可空=noauth）" "") || { end_config_op_cancel; return 1; }
+  pass=""
+  [[ -n "${user}" ]] && { pass=$(tui_password "SOCKS5 入站" "密码" "") || { end_config_op_cancel; return 1; }; }
+  tag="socks-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --arg username "${user}" --arg password "${pass}" \
+    '{tag:$tag,enabled:true,port:$port,username:$username,password:$password,email:$tag,outbound:"proxy"}')
+  upsert_node socks "${node}"
+  fw_allow_tcp "${port}"
+  fw_allow_udp "${port}"
+  if apply_xray_config; then
+    end_config_op_ok
+    show_share_and_qr "SOCKS5 入站已创建" "$(socks_share_link "${node}")"
+  else
+    end_config_op_fail
+  fi
+}
+
+menu_config_tunnel() {
+  local port dest_host dest_port net tag node
+  begin_config_op
+  port=$(tui_input "Tunnel" "本机监听端口" "10086") || { end_config_op_cancel; return 1; }
+  assert_port_free "${port}" || { end_config_op_cancel; return 1; }
+  dest_host=$(tui_input "Tunnel" "转发目标地址" "1.1.1.1") || { end_config_op_cancel; return 1; }
+  dest_port=$(tui_input "Tunnel" "转发目标端口" "443") || { end_config_op_cancel; return 1; }
+  if ! [[ "${dest_port}" =~ ^[0-9]+$ ]]; then
+    tui_msg "错误" "目标端口无效"
+    end_config_op_cancel
+    return 1
+  fi
+  net=$(tui_menu "Tunnel 网络" "dokodemo-door network" \
+    "tcp,udp" "TCP+UDP" \
+    "tcp" "仅 TCP" \
+    "udp" "仅 UDP") || { end_config_op_cancel; return 1; }
+  tag="tunnel-${port}"
+  node=$(jq -n --arg tag "${tag}" --argjson port "${port}" --argjson target_port "${dest_port}" \
+    --arg target_address "${dest_host}" --arg network "${net}" \
+    '{tag:$tag,enabled:true,port:$port,target_address:$target_address,target_port:$target_port,network:$network,email:$tag,outbound:"proxy"}')
+  upsert_node tunnel "${node}"
+  [[ "${net}" == *tcp* ]] && fw_allow_tcp "${port}"
+  [[ "${net}" == *udp* ]] && fw_allow_udp "${port}"
+  if apply_xray_config; then
+    end_config_op_ok
+    tui_msg "完成" "$(tunnel_share_link "${node}")"
   else
     end_config_op_fail
   fi
@@ -2980,7 +4054,7 @@ menu_manage_generic() {
         ;;
       out)
         begin_config_op
-        ob=$(tui_menu "出站" "为 ${tag} 选择" "proxy" "Shifter/SOCKS5" "direct" "直连" "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
+        ob=$(prompt_node_outbound "出站 ${tag}") || { end_config_op_cancel; continue; }
         set_node_field "${kind}" "${tag}" outbound "${ob}"
         if apply_all_configs; then end_config_op_ok; else end_config_op_fail; fi
         ;;
@@ -3007,25 +4081,35 @@ menu_manage_hub() {
     "reality" "Reality" \
     "hysteria" "Hysteria2" \
     "vless_ws" "VLESS-WS-TLS" \
-    "vmess" "VMess-WS-TLS" \
-    "trojan" "Trojan-TLS" \
-    "ss" "Shadowsocks 2022") || return 0
+    "vless" "VLESS（全传输）" \
+    "vmess" "VMess" \
+    "trojan" "Trojan" \
+    "ss" "Shadowsocks" \
+    "wg" "WireGuard" \
+    "http" "HTTP 入站" \
+    "socks" "SOCKS5 入站" \
+    "tunnel" "Tunnel") || return 0
   case "${choice}" in
     reality) menu_manage_reality ;;
     hysteria) menu_manage_hysteria ;;
     vless_ws) menu_manage_generic vless_ws "管理 VLESS-WS" ;;
+    vless) menu_manage_generic vless "管理 VLESS" ;;
     vmess) menu_manage_generic vmess "管理 VMess" ;;
     trojan) menu_manage_generic trojan "管理 Trojan" ;;
     ss) menu_manage_generic shadowsocks "管理 Shadowsocks" ;;
+    wg) menu_manage_generic wireguard "管理 WireGuard" ;;
+    http) menu_manage_generic http "管理 HTTP" ;;
+    socks) menu_manage_generic socks "管理 SOCKS" ;;
+    tunnel) menu_manage_generic tunnel "管理 Tunnel" ;;
   esac
 }
 
 menu_outbound_hub() {
   local choice
-  choice=$(tui_menu "出站与分流" "全局 SOCKS5 / WARP / 路由规则" \
+  choice=$(tui_menu "出站与分流" "全局 SOCKS5 / WARP / 路由；配置里固定带 z_direct / IPv4 / IPv6 / blackhole" \
     "socks" "设置 SOCKS5（Shifter）或直连" \
     "warp" "Cloudflare WARP" \
-    "route" "分流规则（BT/广告/CN/黑名单）") || return 0
+    "route" "分流规则（BT/广告/CN/黑名单/IPv6）") || return 0
   case "${choice}" in
     socks) menu_outbound ;;
     warp) menu_warp ;;
@@ -3037,16 +4121,17 @@ menu_outbound_hub() {
 # 菜单：配置 Reality
 #===============================================================================
 menu_config_reality() {
-  local port sni dest domain uuid tag
+  local port sni dest domain uuid tag xport
   begin_config_op
   port=$(tui_input "配置 Reality 节点" "请输入端口" "443") || { end_config_op_cancel; return 1; }
   assert_port_free "${port}" || { end_config_op_cancel; return 1; }
-  domain=$(tui_input "配置 Reality 节点" "请输入伪装域名（与 v2ray-agent 默认列表一致）" "${REALITY_DEFAULT_SNI}") || { end_config_op_cancel; return 1; }
+  domain=$(tui_input "配置 Reality 节点" "伪装域名（回车默认 mozilla；列表与 v2ray-agent 相同）" "${REALITY_DEFAULT_SNI}") || { end_config_op_cancel; return 1; }
   sni=$(tui_input "配置 Reality 节点" "请输入 SNI（客户端 TLS 握手域名）" "${domain}") || { end_config_op_cancel; return 1; }
   dest=$(tui_input "配置 Reality 节点" "请输入 target（Reality 伪装目标，格式 host:port）" "${domain}:443") || { end_config_op_cancel; return 1; }
   if [[ "${dest}" != *:* ]]; then
     dest="${dest}:443"
   fi
+  check_reality_dest "${dest}" || { end_config_op_cancel; return 1; }
   tag="reality-${port}"
   if jq -e --arg tag "${tag}" '.reality[] | select(.tag==$tag)' "${XCC_NODES}" >/dev/null 2>&1; then
     if ! tui_yesno "节点已存在" "标签 ${tag} 已存在，是否覆盖？"; then
@@ -3060,12 +4145,15 @@ menu_config_reality() {
     end_config_op_fail
     return 1
   fi
+  maybe_init_mldsa65 "${dest}"
   uuid=$(xray_uuid)
+  xport=$(alloc_reality_local_port)
   local short_id node tmp
   short_id="${REALITY_DEFAULT_SID}"
   node=$(jq -n \
     --arg tag "${tag}" \
     --argjson port "${port}" \
+    --argjson xray_port "${xport}" \
     --arg uuid "${uuid}" \
     --arg private_key "${REALITY_PRIV}" \
     --arg public_key "${REALITY_PUB}" \
@@ -3074,13 +4162,15 @@ menu_config_reality() {
     --arg short_id "${short_id}" \
     --arg domain "${domain}" \
     --arg email "${tag}" \
+    --arg mldsa_seed "${REALITY_MLDSA_SEED:-}" \
+    --arg mldsa_verify "${REALITY_MLDSA_VERIFY:-}" \
     '{
-      tag:$tag, enabled:true, port:$port, uuid:$uuid, email:$email,
+      tag:$tag, enabled:true, port:$port, xray_port:$xray_port, uuid:$uuid, email:$email,
       private_key:$private_key, public_key:$public_key,
       sni:$sni, dest:$dest, domain:$domain,
       flow:"xtls-rprx-vision", fingerprint:"chrome",
       tls:"1.3", short_id:$short_id, outbound:"proxy"
-    }')
+    } + (if $mldsa_seed == "" then {} else {mldsa65_seed:$mldsa_seed, mldsa65_verify:$mldsa_verify} end)')
   if ! jq_apply "${XCC_NODES}" --arg tag "${tag}" --argjson node "${node}" \
     '(.reality) |= (map(select(.tag != $tag)) + [$node])'; then
     tui_msg "错误" "写入 nodes.json 失败"
@@ -3296,10 +4386,7 @@ menu_manage_reality() {
       out)
         begin_config_op
         local ob
-        ob=$(tui_menu "出站方式" "为 ${tag} 选择出站" \
-          "proxy" "Shifter / SOCKS5 默认出站" \
-          "direct" "直连" \
-          "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
+        ob=$(prompt_node_outbound "出站 ${tag}") || { end_config_op_cancel; continue; }
         set_node_field reality "${tag}" outbound "${ob}"
         if apply_xray_config; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
@@ -3374,10 +4461,7 @@ menu_manage_hysteria() {
       out)
         begin_config_op
         local ob
-        ob=$(tui_menu "出站方式" "为 ${tag} 选择出站" \
-          "proxy" "Shifter / SOCKS5 默认出站" \
-          "direct" "直连" \
-          "warp" "Cloudflare WARP") || { end_config_op_cancel; continue; }
+        ob=$(prompt_node_outbound "出站 ${tag}") || { end_config_op_cancel; continue; }
         set_node_field hysteria "${tag}" outbound "${ob}"
         if apply_all_configs; then end_config_op_ok; else tui_msg "错误" "应用配置失败"; end_config_op_fail; fi
         ;;
@@ -3677,10 +4761,127 @@ check_remote_xcc_version() {
 }
 
 #===============================================================================
-# 看门狗主循环（每分钟一次）
+# 看门狗：健康检查 / 熔断 / 出站切换 / 系统维护 / 每周更新
 #===============================================================================
+xray_nodes_enabled() {
+  [[ -f "${XCC_NODES}" ]] || return 1
+  jq -e '[
+    (.reality[]?, .vless_ws[]?, .vless[]?, .vmess[]?, .trojan[]?,
+     .shadowsocks[]?, .wireguard[]?, .http[]?, .socks[]?, .tunnel[]?)
+    | select(.enabled == true)
+  ] | length > 0' "${XCC_NODES}" >/dev/null 2>&1
+}
+
+hy2_nodes_enabled() {
+  [[ -f "${XCC_NODES}" ]] || return 1
+  local n
+  n=$(jq '[.hysteria[]? | select(.enabled==true)] | length' "${XCC_NODES}" 2>/dev/null || echo 0)
+  [[ "${n}" =~ ^[0-9]+$ && "${n}" -gt 0 ]]
+}
+
+xray_expected_tcp_ports() {
+  [[ -f "${XCC_NODES}" ]] || return 0
+  local nginx_front="false"
+  nginx_front_enabled && nginx_front="true"
+  jq -r --argjson nginx_front "${nginx_front}" --argjson api "${XRAY_API_PORT}" '
+    def nginxable: ((.network // "tcp") == "ws" or (.network // "") == "httpupgrade");
+    [
+      (.reality[]? | select(.enabled==true) | .port),
+      (.vless_ws[]? | select(.enabled==true) | if $nginx_front then (.xray_port // 31297) else .port end),
+      (.vless[]? | select(.enabled==true and ((.network // "tcp") != "kcp")) |
+        if $nginx_front and nginxable then (.xray_port // 31297) else .port end),
+      (.vmess[]? | select(.enabled==true and ((.network // "ws") != "kcp")) |
+        if $nginx_front and nginxable then (.xray_port // 31299) else .port end),
+      (.trojan[]? | select(.enabled==true) |
+        if $nginx_front and nginxable then (.xray_port // 31300) else .port end),
+      (.shadowsocks[]? | select(.enabled==true) | .port),
+      (.http[]? | select(.enabled==true) | .port),
+      (.socks[]? | select(.enabled==true) | .port),
+      (.tunnel[]? | select(.enabled==true) | .port),
+      (.wireguard[]? | select(.enabled==true) | .port)
+    ] | map(select(. != null)) | unique | .[]
+  ' "${XCC_NODES}" 2>/dev/null
+  if xray_nodes_enabled; then
+    printf '%s\n' "${XRAY_API_PORT}"
+  fi
+}
+
+hy2_expected_udp_ports() {
+  [[ -f "${XCC_NODES}" ]] || return 0
+  jq -r '
+    [
+      (.hysteria[]? | select(.enabled==true) | .port),
+      (.vless[]? | select(.enabled==true and (.network // "") == "kcp") | .port),
+      (.vmess[]? | select(.enabled==true and (.network // "") == "kcp") | .port)
+    ] | map(select(. != null)) | unique | .[]
+  ' "${XCC_NODES}" 2>/dev/null
+}
+
+nginx_expected_tcp_ports() {
+  [[ -f "${NGINX_CONF}" ]] || return 0
+  printf '%s\n' "80"
+  if nginx_front_enabled; then
+    nginx_public_port
+  fi
+}
+
+watchdog_tui_busy() {
+  pgrep -af "xcc run" >/dev/null 2>&1
+}
+
+watchdog_read_count() {
+  local f="$1"
+  if [[ -f "${f}" ]] && [[ "$(tr -d ' \n' < "${f}")" =~ ^[0-9]+$ ]]; then
+    tr -d ' \n' < "${f}"
+  else
+    printf '0'
+  fi
+}
+
+watchdog_set_count() {
+  local f="$1" n="$2"
+  printf '%s\n' "${n}" > "${f}"
+}
+
+watchdog_inc_count() {
+  local f="$1" n
+  n=$(watchdog_read_count "${f}")
+  n=$((n + 1))
+  watchdog_set_count "${f}" "${n}"
+  printf '%s' "${n}"
+}
+
+watchdog_reset_count() {
+  rm -f "$1"
+}
+
+cert_days_left() {
+  local f="$1" end now
+  [[ -f "${f}" ]] || { printf '-1'; return 1; }
+  end=$(openssl x509 -enddate -noout -in "${f}" 2>/dev/null | cut -d= -f2) || { printf '-1'; return 1; }
+  end=$(date -d "${end}" +%s 2>/dev/null) || { printf '-1'; return 1; }
+  now=$(date +%s)
+  printf '%s' $(( (end - now) / 86400 ))
+}
+
+watchdog_apply_safe() {
+  if watchdog_tui_busy; then
+    xcc_log WARN "TUI 正在运行，跳过自动应用配置"
+    return 1
+  fi
+  TUI_BACKEND=none
+  apply_xray_config || return 1
+  apply_singbox_config || return 1
+  if [[ -f "${NGINX_CONF}" ]] || nginx_front_enabled; then
+    apply_nginx_config || return 1
+  fi
+  return 0
+}
+
 watchdog_cleanup_old_logs() {
   find /var/log/ -name "xcc.log.*" -mtime +7 -delete 2>/dev/null || true
+  find "${XCC_TMP_DIR}" -type f -mtime +1 -delete 2>/dev/null || true
+  find /var/tmp -maxdepth 1 -name 'xcc-*' -mtime +2 -delete 2>/dev/null || true
 }
 
 watchdog_disk() {
@@ -3690,8 +4891,11 @@ watchdog_disk() {
     usage=$(df -P / | awk 'NR==2{print $5}' | sed 's/%//')
   fi
   if [[ "${usage}" =~ ^[0-9]+$ && "${usage}" -gt 85 ]]; then
-    xcc_log ERROR "磁盘使用率 ${usage}% 超过 85%"
+    xcc_log ERROR "磁盘使用率 ${usage}% 超过 85%，正在清理日志 / 临时文件 / journal"
     broadcast "xcc 告警: 磁盘使用率 ${usage}% 超过 85%"
+    watchdog_cleanup_old_logs
+    journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+    find /var/log -type f -name '*.gz' -mtime +14 -delete 2>/dev/null || true
   fi
 }
 
@@ -3707,98 +4911,425 @@ watchdog_load() {
   fi
 }
 
-watchdog_count_recent_restarts() {
+watchdog_count_recent_in() {
+  local file="$1"
   local now cutoff
   now=$(date +%s)
   cutoff=$((now - 300))
-  [[ -f "${WATCHDOG_RESTARTS}" ]] || { printf '0'; return; }
-  awk -v c="${cutoff}" '$1 >= c {n++} END {print n+0}' "${WATCHDOG_RESTARTS}"
+  [[ -f "${file}" ]] || { printf '0'; return; }
+  awk -v c="${cutoff}" '$1 >= c {n++} END {print n+0}' "${file}"
+}
+
+watchdog_record_restart_in() {
+  local file="$1"
+  mkdir -p "${XCC_DIR}"
+  date +%s >> "${file}"
+  tail -n 30 "${file}" > "${file}.tmp" 2>/dev/null || true
+  mv "${file}.tmp" "${file}" 2>/dev/null || true
+}
+
+watchdog_count_recent_restarts() {
+  watchdog_count_recent_in "${WATCHDOG_RESTARTS}"
 }
 
 watchdog_record_restart() {
-  mkdir -p "${XCC_DIR}"
-  date +%s >> "${WATCHDOG_RESTARTS}"
-  tail -n 30 "${WATCHDOG_RESTARTS}" > "${WATCHDOG_RESTARTS}.tmp" 2>/dev/null || true
-  mv "${WATCHDOG_RESTARTS}.tmp" "${WATCHDOG_RESTARTS}" 2>/dev/null || true
+  watchdog_record_restart_in "${WATCHDOG_RESTARTS}"
+}
+
+watchdog_circuit_ok() {
+  local halt="$1" rec="$2" name="$3"
+  if [[ -f "${halt}" ]]; then
+    xcc_log ERROR "${name} 看门狗保护已触发，等待人工介入（主菜单重置）。"
+    return 1
+  fi
+  local n
+  n=$(watchdog_count_recent_in "${rec}")
+  if [[ "${n}" -ge 3 ]]; then
+    : > "${halt}"
+    xcc_log ERROR "${name} 5 分钟内重启超过 3 次，已停止自动重启。"
+    broadcast "xcc 紧急告警: ${name} 5 分钟内重启超过 3 次，已停止自动重启。"
+    return 1
+  fi
+  return 0
+}
+
+watchdog_restart_svc() {
+  local unit="$1" halt="$2" rec="$3" name="$4"
+  watchdog_circuit_ok "${halt}" "${rec}" "${name}" || return 1
+  if watchdog_tui_busy; then
+    xcc_log WARN "TUI 正在运行，暂不重启 ${name}"
+    return 1
+  fi
+  xcc_log WARN "${name} 不健康，正在 systemctl restart ${unit}"
+  systemctl enable "${unit}" >/dev/null 2>&1 || true
+  systemctl restart "${unit}" >/dev/null 2>&1 || true
+  watchdog_record_restart_in "${rec}"
+}
+
+watchdog_nodes_json_ok() {
+  [[ -f "${XCC_NODES}" ]] && jq empty "${XCC_NODES}" >/dev/null 2>&1
+}
+
+watchdog_missing_tcp_ports() {
+  local p miss=0
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] || continue
+    if ! port_busy_tcp "${p}"; then
+      xcc_log WARN "TCP ${p} 未在监听"
+      miss=1
+    fi
+  done
+  return "${miss}"
+}
+
+watchdog_missing_udp_ports() {
+  local p miss=0
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] || continue
+    if ! port_busy_udp "${p}"; then
+      xcc_log WARN "UDP ${p} 未在监听"
+      miss=1
+    fi
+  done
+  return "${miss}"
+}
+
+watchdog_xray_api_ok() {
+  [[ -x "${XRAY_BIN}" ]] || return 0
+  if timeout 4 "${XRAY_BIN}" api statssys --server="${XRAY_API_ADDR}" >/dev/null 2>&1 \
+    || timeout 4 "${XRAY_BIN}" api statsquery --server="${XRAY_API_ADDR}" >/dev/null 2>&1; then
+    return 0
+  fi
+  if timeout 3 bash -c "echo >/dev/tcp/127.0.0.1/${XRAY_API_PORT}" >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+watchdog_repair_xray_config() {
+  if ! watchdog_nodes_json_ok; then
+    xcc_log ERROR "nodes.json 损坏，拒绝重建 Xray 配置，请人工修复 ${XCC_NODES}"
+    broadcast "xcc 紧急告警: nodes.json 损坏，看门狗已停止自动改配置。"
+    return 1
+  fi
+  if [[ -x "${XRAY_BIN}" && -f "${XRAY_CONF}" ]] && xray_test_config "${XRAY_CONF}"; then
+    return 0
+  fi
+  xcc_log WARN "Xray 配置缺失或语法失败，正在从 nodes.json 重建"
+  watchdog_apply_safe || {
+    xcc_log ERROR "从 nodes.json 重建 Xray 配置失败"
+    return 1
+  }
+  return 0
 }
 
 watchdog_check_xray() {
-  if [[ ! -x "${XRAY_BIN}" ]]; then
+  xray_nodes_enabled || return 0
+  [[ -x "${XRAY_BIN}" ]] || return 0
+
+  if ! watchdog_nodes_json_ok; then
+    xcc_log ERROR "nodes.json 无效，跳过 Xray 重启以免放大故障"
     return 0
   fi
+
   if [[ -f "${WATCHDOG_HALT}" ]]; then
-    xcc_log ERROR "看门狗保护已触发（5 分钟内重启超过 3 次），等待人工介入。删除 ${WATCHDOG_HALT} 后恢复。"
+    xcc_log ERROR "Xray 看门狗保护已触发，仅尝试修复配置。"
+    watchdog_repair_xray_config || true
     return 0
   fi
-  if is_svc_active xray; then
+
+  if ! watchdog_repair_xray_config; then
+    xcc_log ERROR "无法修复 Xray 配置，本轮不重启，以免坏配置死循环"
+    return 0
+  fi
+
+  local unhealthy=0
+  if ! is_svc_active xray; then
+    unhealthy=1
+    xcc_log WARN "Xray 服务未运行"
+  else
+    if ! xray_expected_tcp_ports | watchdog_missing_tcp_ports; then
+      unhealthy=1
+    fi
+    if ! watchdog_xray_api_ok; then
+      xcc_log WARN "Xray API ${XRAY_API_ADDR} 无响应（进程可能卡死）"
+      unhealthy=1
+    fi
+  fi
+
+  if [[ "${unhealthy}" -eq 0 ]]; then
+    watchdog_reset_count "${WATCHDOG_UNHEALTHY_XRAY}"
     return 0
   fi
   local n
-  n=$(watchdog_count_recent_restarts)
-  if [[ "${n}" -ge 3 ]]; then
-    : > "${WATCHDOG_HALT}"
-    xcc_log ERROR "5 分钟内重启超过 3 次，已停止自动重启，请人工介入。"
-    broadcast "xcc 紧急告警: Xray 5 分钟内重启超过 3 次，已停止自动重启。"
-    return 0
+  n=$(watchdog_inc_count "${WATCHDOG_UNHEALTHY_XRAY}")
+  if [[ "${n}" -ge 2 ]]; then
+    watchdog_restart_svc xray "${WATCHDOG_HALT}" "${WATCHDOG_RESTARTS}" "Xray" || true
+    watchdog_reset_count "${WATCHDOG_UNHEALTHY_XRAY}"
   fi
-  xcc_log WARN "Xray 未运行，正在 systemctl restart xray"
-  systemctl restart xray >/dev/null 2>&1 || true
-  watchdog_record_restart
 }
 
 watchdog_check_singbox() {
-  local n
-  [[ -f "${XCC_NODES}" ]] || return 0
-  n=$(jq '[.hysteria[]? | select(.enabled==true)] | length' "${XCC_NODES}" 2>/dev/null || echo 0)
-  [[ "${n}" -gt 0 ]] || return 0
+  hy2_nodes_enabled || return 0
+  if [[ -f "${WATCHDOG_HALT_SB}" ]]; then
+    xcc_log ERROR "sing-box 看门狗保护已触发，仅尝试校验配置。"
+    if [[ -f "${SINGBOX_CONF}" ]]; then
+      singbox_test_config "${SINGBOX_CONF}" || watchdog_apply_safe || true
+    fi
+    return 0
+  fi
+  if [[ -f "${SINGBOX_CONF}" ]] && ! singbox_test_config "${SINGBOX_CONF}"; then
+    xcc_log WARN "sing-box 配置损坏，正在重建"
+    if ! watchdog_apply_safe; then
+      watchdog_restart_svc sing-box "${WATCHDOG_HALT_SB}" "${WATCHDOG_RESTARTS_SB}" "sing-box" || true
+      return 0
+    fi
+  fi
+  local unhealthy=0
   if ! is_svc_active sing-box; then
-    xcc_log WARN "sing-box 未运行，正在重启"
-    systemctl restart sing-box >/dev/null 2>&1 || true
+    unhealthy=1
+  elif ! hy2_expected_udp_ports | watchdog_missing_udp_ports; then
+    unhealthy=1
+  fi
+  if [[ "${unhealthy}" -eq 0 ]]; then
+    watchdog_reset_count "${WATCHDOG_UNHEALTHY_SB}"
+    return 0
+  fi
+  local n
+  n=$(watchdog_inc_count "${WATCHDOG_UNHEALTHY_SB}")
+  if [[ "${n}" -ge 2 ]]; then
+    watchdog_restart_svc sing-box "${WATCHDOG_HALT_SB}" "${WATCHDOG_RESTARTS_SB}" "sing-box" || true
+    watchdog_reset_count "${WATCHDOG_UNHEALTHY_SB}"
   fi
 }
 
 watchdog_check_nginx() {
   command -v nginx >/dev/null 2>&1 || return 0
   [[ -f "${NGINX_CONF}" ]] || return 0
+  if [[ -f "${WATCHDOG_HALT_NGINX}" ]]; then
+    xcc_log ERROR "Nginx 看门狗保护已触发，仅尝试 nginx -t / 重建。"
+    nginx -t >/dev/null 2>&1 || watchdog_apply_safe || true
+    return 0
+  fi
+  if ! nginx -t >/dev/null 2>&1; then
+    xcc_log WARN "nginx -t 失败，正在重建站点配置"
+    if ! watchdog_apply_safe || ! nginx -t >/dev/null 2>&1; then
+      watchdog_restart_svc nginx "${WATCHDOG_HALT_NGINX}" "${WATCHDOG_RESTARTS_NGINX}" "Nginx" || true
+      return 0
+    fi
+  fi
+  local unhealthy=0
   if ! is_svc_active nginx; then
-    xcc_log WARN "Nginx 未运行，正在重启"
-    systemctl restart nginx >/dev/null 2>&1 || true
+    unhealthy=1
+  elif ! nginx_expected_tcp_ports | watchdog_missing_tcp_ports; then
+    unhealthy=1
+  fi
+  if [[ "${unhealthy}" -eq 0 ]]; then
+    watchdog_reset_count "${WATCHDOG_UNHEALTHY_NGINX}"
+    return 0
+  fi
+  local n
+  n=$(watchdog_inc_count "${WATCHDOG_UNHEALTHY_NGINX}")
+  if [[ "${n}" -ge 2 ]]; then
+    watchdog_restart_svc nginx "${WATCHDOG_HALT_NGINX}" "${WATCHDOG_RESTARTS_NGINX}" "Nginx" || true
+    watchdog_reset_count "${WATCHDOG_UNHEALTHY_NGINX}"
   fi
 }
 
-watchdog_check_outbound() {
-  [[ -f "${XCC_OUTBOUND}" ]] || return 0
-  local url mode
-  url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
-  [[ -n "${url}" && "${url}" != DIRECT && "${url}" != direct ]] || return 0
-  parse_socks5 "${url}"
-  local proxy_url exit_ip
+watchdog_socks_probe() {
+  local raw="$1" proxy_url
+  parse_socks5 "${raw}"
+  [[ -n "${SOCKS_HOST}" && "${SOCKS_PORT}" =~ ^[0-9]+$ ]] || return 1
   if [[ -n "${SOCKS_USER}" ]]; then
     proxy_url="socks5h://${SOCKS_USER}:${SOCKS_PASS}@${SOCKS_HOST}:${SOCKS_PORT}"
   else
     proxy_url="socks5h://${SOCKS_HOST}:${SOCKS_PORT}"
   fi
-  if ! curl -fL --max-time 15 -x "${proxy_url}" -o /dev/null -sS "https://www.google.com" >/dev/null 2>&1; then
-    xcc_log ERROR "SOCKS5 代理连通性检查失败（访问 google.com）"
+  curl -fL --max-time 12 -x "${proxy_url}" -o /dev/null -sS "https://www.google.com" >/dev/null 2>&1
+}
+
+watchdog_check_outbound() {
+  local url orig
+  [[ -f "${XCC_OUTBOUND}" ]] || return 0
+  url=$(tr -d '\r' < "${XCC_OUTBOUND}" | head -n1)
+  orig=""
+  [[ -f "${WATCHDOG_OUTBOUND_ORIG}" ]] && orig=$(tr -d '\r' < "${WATCHDOG_OUTBOUND_ORIG}" | head -n1)
+
+  if [[ -n "${orig}" && ( -z "${url}" || "${url}" == DIRECT || "${url}" == direct ) ]]; then
+    if watchdog_socks_probe "${orig}"; then
+      local ok
+      ok=$(watchdog_inc_count "${WATCHDOG_SOCKS_RECOVER}")
+      if [[ "${ok}" -ge 2 ]]; then
+        xcc_log INFO "SOCKS5 已恢复，切回 ${orig}"
+        printf '%s\n' "${orig}" > "${XCC_OUTBOUND}"
+        chmod 600 "${XCC_OUTBOUND}"
+        rm -f "${WATCHDOG_OUTBOUND_ORIG}" "${WATCHDOG_SOCKS_FAILS}" "${WATCHDOG_SOCKS_RECOVER}"
+        watchdog_apply_safe || true
+        broadcast "xcc: SOCKS5 出站已恢复"
+      fi
+    else
+      watchdog_reset_count "${WATCHDOG_SOCKS_RECOVER}"
+    fi
+    return 0
   fi
-  exit_ip=$(curl -fL --max-time 15 -x "${proxy_url}" -sS "${IPIFY_URL}" 2>/dev/null || true)
-  if [[ -n "${exit_ip}" && "${exit_ip}" != "${SOCKS_HOST}" ]]; then
-    xcc_log WARN "出口 IP ${exit_ip} 与代理地址 ${SOCKS_HOST} 不一致"
+
+  [[ -n "${url}" && "${url}" != DIRECT && "${url}" != direct ]] || return 0
+  if watchdog_socks_probe "${url}"; then
+    watchdog_reset_count "${WATCHDOG_SOCKS_FAILS}"
+    return 0
+  fi
+  xcc_log ERROR "SOCKS5 连通失败，连续计数中"
+  local n
+  n=$(watchdog_inc_count "${WATCHDOG_SOCKS_FAILS}")
+  if [[ "${n}" -ge 3 ]]; then
+    xcc_log ERROR "SOCKS5 连续失败 ${n} 次，切换为 DIRECT，避免节点走死出站"
+    printf '%s\n' "${url}" > "${WATCHDOG_OUTBOUND_ORIG}"
+    chmod 600 "${WATCHDOG_OUTBOUND_ORIG}"
+    printf 'DIRECT\n' > "${XCC_OUTBOUND}"
+    chmod 600 "${XCC_OUTBOUND}"
+    watchdog_reset_count "${WATCHDOG_SOCKS_FAILS}"
+    watchdog_apply_safe || true
+    broadcast "xcc 告警: SOCKS5 不可用，已临时切直连。恢复后会自动切回。"
+  fi
+}
+
+watchdog_ntp() {
+  command -v timedatectl >/dev/null 2>&1 || return 0
+  timedatectl set-ntp true >/dev/null 2>&1 || true
+  local status
+  status=$(timedatectl status 2>/dev/null || true)
+  if printf '%s' "${status}" | grep -Eqi 'NTP synchronized: yes|System clock synchronized: yes'; then
+    return 0
+  fi
+  xcc_log WARN "系统时间未同步，正在强制对时（Reality maxTimeDiff=70s）"
+  if command -v chronyc >/dev/null 2>&1; then
+    chronyc -a makestep >/dev/null 2>&1 || true
+  elif command -v ntpdate >/dev/null 2>&1; then
+    ntpdate -u pool.ntp.org >/dev/null 2>&1 || ntpdate -u time.cloudflare.com >/dev/null 2>&1 || true
+  fi
+  status=$(timedatectl status 2>/dev/null || true)
+  if ! printf '%s' "${status}" | grep -Eqi 'NTP synchronized: yes|System clock synchronized: yes'; then
+    xcc_log ERROR "NTP 仍未同步，Reality 可能因时间偏差失败"
+    broadcast "xcc 告警: 系统时间未同步，Reality 可能不可用"
+  fi
+}
+
+watchdog_renew_certs() {
+  local cert domain days acme
+  [[ -f "${XCC_NODES}" ]] || return 0
+  cert=$(jq -r '.settings.cert // empty' "${XCC_NODES}" 2>/dev/null)
+  domain=$(jq -r '.settings.domain // empty' "${XCC_NODES}" 2>/dev/null)
+  [[ -n "${cert}" && -f "${cert}" ]] || return 0
+  days=$(cert_days_left "${cert}")
+  if [[ ! "${days}" =~ ^-?[0-9]+$ ]]; then
+    return 0
+  fi
+  if [[ "${days}" -lt 0 ]]; then
+    xcc_log ERROR "证书已过期: ${cert}"
+    broadcast "xcc 告警: TLS 证书已过期"
+  elif [[ "${days}" -le 21 ]]; then
+    xcc_log WARN "证书剩余 ${days} 天，尝试续签"
+  else
+    return 0
+  fi
+  acme="${HOME}/.acme.sh/acme.sh"
+  if [[ ! -x "${acme}" ]]; then
+    xcc_log WARN "未安装 acme.sh，跳过自动续签（自签名请忽略）"
+    return 0
+  fi
+  if watchdog_tui_busy; then
+    return 0
+  fi
+  TUI_BACKEND=none
+  "${acme}" --cron --home "${HOME}/.acme.sh" >/dev/null 2>&1 || true
+  if [[ -n "${domain}" ]]; then
+    "${acme}" --renew -d "${domain}" >/dev/null 2>&1 || true
+    "${acme}" --install-cert -d "${domain}" \
+      --key-file "${XCC_CERT_DIR}/privkey.pem" \
+      --fullchain-file "${XCC_CERT_DIR}/fullchain.pem" \
+      --reloadcmd "systemctl reload nginx; systemctl reload xray || systemctl restart xray; systemctl restart sing-box" \
+      >/dev/null 2>&1 || true
+  fi
+}
+
+watchdog_weekly_due() {
+  local now last
+  now=$(date +%s)
+  if [[ ! -f "${WATCHDOG_WEEKLY_STAMP}" ]]; then
+    printf '%s\n' "${now}" > "${WATCHDOG_WEEKLY_STAMP}"
+    return 1
+  fi
+  last=$(tr -d ' \n' < "${WATCHDOG_WEEKLY_STAMP}")
+  [[ "${last}" =~ ^[0-9]+$ ]] || last=0
+  [[ $((now - last)) -ge "${WATCHDOG_WEEKLY_SECS}" ]]
+}
+
+watchdog_update_xcc() {
+  local tmp remote
+  tmp=$(xcc_mktemp)
+  if ! download_github_file "${tmp}" "xcc"; then
+    xcc_log WARN "每周更新：下载 xcc 失败"
+    rm -f "${tmp}"
+    return 1
+  fi
+  remote=$(grep -m1 '^XCC_VERSION=' "${tmp}" | cut -d= -f2 | tr -d '"' || true)
+  if [[ -z "${remote}" ]] || ! version_newer "${remote}" "${XCC_VERSION}"; then
+    rm -f "${tmp}"
+    return 0
+  fi
+  chmod 755 "${tmp}"
+  mv "${tmp}" "${XCC_BIN}"
+  chmod 755 "${XCC_BIN}"
+  xcc_log INFO "xcc 已自动更新到 ${remote}，即将重启看门狗"
+  systemctl restart xcc-watchdog >/dev/null 2>&1 || true
+}
+
+watchdog_weekly() {
+  watchdog_weekly_due || return 0
+  if watchdog_tui_busy; then
+    xcc_log INFO "每周维护到期，但 TUI 正在运行，下一分钟再试"
+    return 0
+  fi
+  xcc_log INFO "开始每周维护：证书 / geoip / Xray / sing-box / xcc"
+  TUI_BACKEND=none
+  watchdog_renew_certs || true
+  install_geodata || true
+  install_xray auto || true
+  if [[ -x "${SINGBOX_BIN}" ]] || hy2_nodes_enabled; then
+    install_singbox auto || true
+  fi
+  watchdog_apply_safe || true
+  date +%s > "${WATCHDOG_WEEKLY_STAMP}"
+  watchdog_update_xcc || true
+}
+
+watchdog_units() {
+  systemctl enable xcc-watchdog >/dev/null 2>&1 || true
+  if xray_nodes_enabled; then
+    systemctl enable xray >/dev/null 2>&1 || true
+  fi
+  if hy2_nodes_enabled; then
+    systemctl enable sing-box >/dev/null 2>&1 || true
   fi
 }
 
 cmd_watchdog() {
   need_root
   init_tmp
-  watchdog_cleanup_old_logs
-  xcc_log INFO "看门狗启动"
+  TUI_BACKEND=none
+  xcc_log INFO "看门狗启动（健康检查 / 熔断 / 出站切换 / 每周更新）"
   while true; do
+    watchdog_cleanup_old_logs
     watchdog_disk
     watchdog_load
+    watchdog_ntp
+    watchdog_units
+    watchdog_renew_certs
     watchdog_check_xray
     watchdog_check_singbox
     watchdog_check_nginx
     watchdog_check_outbound
+    watchdog_weekly
     sleep 60
   done
 }
@@ -3820,11 +5351,14 @@ show_startup_warnings() {
 main_menu() {
   local choice extra
   extra=""
-  if [[ -f "${WATCHDOG_HALT}" ]]; then
-    extra=$'\n'"⚠ 看门狗保护已触发，Xray 不会自动重启。可选择重置。"
+  if [[ -f "${WATCHDOG_HALT}" || -f "${WATCHDOG_HALT_SB}" || -f "${WATCHDOG_HALT_NGINX}" ]]; then
+    extra=$'\n'"⚠ 看门狗保护已触发（进程熔断），不会自动重启。可选择重置。"
+  fi
+  if [[ -f "${WATCHDOG_OUTBOUND_ORIG}" ]]; then
+    extra+=$'\n'"⚠ SOCKS5 已临时切直连，恢复后会自动切回。"
   fi
   while true; do
-    choice=$(tui_menu "xcc 主菜单" "v2.1 多协议管理（Xray + sing-box Hysteria2 + Nginx，单机单用户）${extra}" \
+    choice=$(tui_menu "xcc 主菜单" "v2.2 协议覆盖对齐 3X-UI（单机单用户）${extra}" \
       "d" "状态面板 / 流量" \
       "q" "一键 Reality（无域名）" \
       "1" "配置 Reality 节点" \
@@ -3832,7 +5366,8 @@ main_menu() {
       "v" "配置 VLESS-WS-TLS" \
       "m" "配置 VMess-WS-TLS" \
       "t" "配置 Trojan-TLS" \
-      "s" "配置 Shadowsocks 2022" \
+      "s" "配置 Shadowsocks" \
+      "p" "更多协议（gRPC/XHTTP/WG/HTTP/SOCKS/Tunnel）" \
       "3" "管理节点" \
       "u" "订阅 / 分享链接" \
       "5" "出站 / WARP / 分流" \
@@ -3854,6 +5389,7 @@ main_menu() {
       m) menu_config_vmess ;;
       t) menu_config_trojan ;;
       s) menu_config_ss ;;
+      p) menu_more_protocols ;;
       3) menu_manage_hub ;;
       u) menu_subscribe ;;
       5) menu_outbound_hub ;;
@@ -3865,13 +5401,199 @@ main_menu() {
       8) menu_restore ;;
       9) menu_uninstall ;;
       r)
-        rm -f "${WATCHDOG_HALT}" "${WATCHDOG_RESTARTS}"
+        rm -f "${WATCHDOG_HALT}" "${WATCHDOG_HALT_SB}" "${WATCHDOG_HALT_NGINX}" \
+          "${WATCHDOG_RESTARTS}" "${WATCHDOG_RESTARTS_SB}" "${WATCHDOG_RESTARTS_NGINX}" \
+          "${WATCHDOG_UNHEALTHY_XRAY}" "${WATCHDOG_UNHEALTHY_SB}" "${WATCHDOG_UNHEALTHY_NGINX}"
         extra=""
-        tui_msg "完成" "已重置看门狗保护。"
+        tui_msg "完成" "已重置 Xray / sing-box / Nginx 看门狗保护。"
         ;;
       0) exit 0 ;;
     esac
   done
+}
+
+cmd_selftest() {
+  local work out fail=0 node link tags ports days
+  TUI_BACKEND=none
+  work=$(mktemp -d /tmp/xcc-selftest.XXXXXX)
+  XCC_DIR="${work}"
+  XCC_NODES="${work}/nodes.json"
+  XCC_OUTBOUND="${work}/outbound.conf"
+  XCC_WARP_FILE="${work}/warp.json"
+  XCC_TMP_DIR="${work}/tmp"
+  XRAY_CONF="${work}/xray.json"
+  mkdir -p "${XCC_TMP_DIR}"
+  printf 'DIRECT\n' > "${XCC_OUTBOUND}"
+  public_ip() { printf '203.0.113.8'; }
+
+  cat > "${XCC_NODES}" <<'JSON'
+{
+  "reality": [{
+    "tag": "reality-443", "enabled": true, "port": 443, "xray_port": 45987,
+    "uuid": "11111111-1111-1111-1111-111111111111", "email": "reality-443",
+    "private_key": "PRIVKEY", "public_key": "PUBKEY",
+    "sni": "download-installer.cdn.mozilla.net",
+    "dest": "download-installer.cdn.mozilla.net:443",
+    "domain": "download-installer.cdn.mozilla.net",
+    "flow": "xtls-rprx-vision", "fingerprint": "chrome", "tls": "1.3",
+    "short_id": "6ba85179e30d4fc2", "outbound": "proxy"
+  }],
+  "hysteria": [], "vless_ws": [],
+  "vless": [{
+    "tag": "vless-grpc-8443", "enabled": true, "port": 8443,
+    "uuid": "22222222-2222-2222-2222-222222222222",
+    "network": "grpc", "security": "tls", "service_name": "grpc",
+    "sni": "example.com", "email": "vless-grpc", "outbound": "IPv6_out"
+  }],
+  "vmess": [], "trojan": [],
+  "shadowsocks": [{
+    "tag": "ss-8388", "enabled": true, "port": 8388,
+    "method": "2022-blake3-aes-128-gcm", "password": "sspass", "outbound": "direct"
+  }],
+  "wireguard": [], "http": [], "socks": [], "tunnel": [],
+  "settings": {
+    "block_bt": true, "block_ads": false, "cn_direct": false,
+    "domain_block": [], "ipv6_domains": ["domain:ipv6.example"],
+    "sub_token": "", "nginx_port": 443
+  }
+}
+JSON
+
+  out="${work}/xray-direct.json"
+  if ! build_xray_config_json "${out}"; then
+    err "selftest: 直连模式生成失败"
+    rm -rf "${work}"
+    return 1
+  fi
+  jq empty "${out}" || { err "selftest: JSON 无效"; fail=1; }
+
+  tags=$(jq -r '[.inbounds[].tag] | join(" ")' "${out}")
+  printf '%s\n' "${tags}" | grep -q 'dokodemo-in-reality-443' || { err "缺 dokodemo 入站"; fail=1; }
+  printf '%s\n' "${tags}" | grep -q 'reality-443' || { err "缺 Reality Vision 入站"; fail=1; }
+
+  jq -e '
+    (.inbounds[] | select(.tag=="dokodemo-in-reality-443")
+      | .protocol=="dokodemo-door"
+        and .port==443
+        and .settings.address=="127.0.0.1"
+        and .settings.port==45987
+        and .sniffing.routeOnly==true
+        and (.sniffing.destOverride==["tls"]))
+  ' "${out}" >/dev/null || { err "dokodemo 与 v2ray-agent 不一致"; fail=1; }
+
+  jq -e '
+    (.inbounds[] | select(.tag=="reality-443")
+      | .listen=="127.0.0.1"
+        and .port==45987
+        and .protocol=="vless"
+        and .streamSettings.security=="reality"
+        and .settings.clients[0].flow=="xtls-rprx-vision"
+        and .streamSettings.realitySettings.minClientVer=="1.8.2"
+        and .streamSettings.realitySettings.maxTimeDiff==70000
+        and .streamSettings.realitySettings.target=="download-installer.cdn.mozilla.net:443"
+        and (.streamSettings.realitySettings.shortIds==["","6ba85179e30d4fc2"])
+        and .sniffing.routeOnly==true)
+  ' "${out}" >/dev/null || { err "Vision 入站与 v2ray-agent 不一致"; fail=1; }
+
+  jq -e '[.outbounds[].tag] | (index("proxy") != null) and (index("direct") != null) and (index("z_direct_outbound") != null) and (index("IPv4_out") != null) and (index("IPv6_out") != null) and (index("blackhole_out") != null)' "${out}" >/dev/null \
+    || { err "出站条目不齐（proxy/direct/z_direct/IPv4/IPv6/blackhole）"; fail=1; }
+
+  jq -e '
+    (.outbounds[] | select(.tag=="z_direct_outbound") | .settings.domainStrategy=="UseIP")
+    and (.outbounds[] | select(.tag=="IPv4_out") | .settings.domainStrategy=="ForceIPv4")
+    and (.outbounds[] | select(.tag=="IPv6_out") | .settings.domainStrategy=="ForceIPv6")
+  ' "${out}" >/dev/null || { err "freedom domainStrategy 与 v2ray-agent 不一致"; fail=1; }
+
+  jq -e '
+    (.routing.rules[] | select(.inboundTag==["dokodemo-in-reality-443"] and .outboundTag=="z_direct_outbound"))
+    and (.routing.rules[] | select(.inboundTag==["reality-443"] and .outboundTag=="proxy"))
+    and (.routing.rules[] | select(.inboundTag==["vless-grpc-8443"] and .outboundTag=="IPv6_out"))
+    and (.routing.rules[] | select(.inboundTag==["ss-8388"] and .outboundTag=="direct"))
+    and (.routing.rules[] | select(.domain==["domain:gstatic.com","domain:googleapis.com","domain:googleapis.cn"] and .outboundTag=="z_direct_outbound"))
+    and (.routing.rules[] | select(.domain==["domain:ipv6.example"] and .outboundTag=="IPv6_out"))
+    and (.routing.rules[] | select(.protocol==["bittorrent"] and .outboundTag=="blackhole_out"))
+  ' "${out}" >/dev/null || { err "路由规则不完整"; fail=1; }
+
+  printf 'SOCKS5://user:pass@10.0.0.2:1080\n' > "${XCC_OUTBOUND}"
+  out="${work}/xray-socks.json"
+  if ! build_xray_config_json "${out}"; then
+    err "selftest: SOCKS5 模式生成失败"
+    fail=1
+  else
+    jq -e '
+      (.outbounds[] | select(.tag=="proxy") | .protocol=="socks")
+      and (.outbounds[] | select(.tag=="socks5_outbound") | .protocol=="socks")
+      and (.routing.rules[] | select(.inboundTag==["dokodemo-in-reality-443"] and .outboundTag=="z_direct_outbound"))
+      and (.routing.rules[] | select(.inboundTag==["reality-443"] and .outboundTag=="proxy"))
+    ' "${out}" >/dev/null || { err "SOCKS5 时 dokodemo 未强制直连或缺少 socks5_outbound"; fail=1; }
+  fi
+
+  node=$(jq -c '.reality[0]' "${XCC_NODES}")
+  link=$(reality_share_link "${node}")
+  printf '%s\n' "${link}" | grep -Eq \
+    '^vless://11111111-1111-1111-1111-111111111111@203\.0\.113\.8:443\?encryption=none&security=reality&type=tcp&sni=download-installer\.cdn\.mozilla\.net&fp=chrome&pbk=PUBKEY&sid=6ba85179e30d4fc2&flow=xtls-rprx-vision#reality-443$' \
+    || { err "Reality 分享链接与 v2ray-agent 不一致: ${link}"; fail=1; }
+
+  write_clash_proxies "${work}/clash.yml" "${work}/clash.names"
+  grep -q 'type: vless' "${work}/clash.yml" || { err "Clash 未生成 Reality"; fail=1; }
+  grep -q 'reality-opts:' "${work}/clash.yml" || { err "Clash 缺少 reality-opts"; fail=1; }
+  grep -q 'short-id: 6ba85179e30d4fc2' "${work}/clash.yml" || { err "Clash sid 与 v2ray-agent 不一致"; fail=1; }
+  grep -q 'flow: xtls-rprx-vision' "${work}/clash.yml" || { err "Clash 缺少 vision flow"; fail=1; }
+
+  xray_nodes_enabled || { err "fixture 应判定为有 Xray 节点"; fail=1; }
+  ports=$(xray_expected_tcp_ports | sort -u | tr '\n' ' ')
+  printf '%s' "${ports}" | grep -qw 443 || { err "期望端口缺少 Reality 443: ${ports}"; fail=1; }
+  printf '%s' "${ports}" | grep -qw 8443 || { err "期望端口缺少 VLESS 8443: ${ports}"; fail=1; }
+  printf '%s' "${ports}" | grep -qw 8388 || { err "期望端口缺少 SS 8388: ${ports}"; fail=1; }
+  printf '%s' "${ports}" | grep -qw 10085 || { err "期望端口缺少 API 10085: ${ports}"; fail=1; }
+
+  openssl req -x509 -newkey rsa:2048 -sha256 -days 30 -nodes \
+    -keyout "${work}/t.key" -out "${work}/t.crt" -subj "/CN=selftest" >/dev/null 2>&1 || true
+  if [[ -f "${work}/t.crt" ]]; then
+    days=$(cert_days_left "${work}/t.crt")
+    [[ "${days}" =~ ^[0-9]+$ && "${days}" -ge 20 && "${days}" -le 31 ]] \
+      || { err "cert_days_left 异常: ${days}"; fail=1; }
+  fi
+
+  WATCHDOG_WEEKLY_STAMP="${work}/weekly.stamp"
+  rm -f "${WATCHDOG_WEEKLY_STAMP}"
+  if watchdog_weekly_due; then
+    err "首次 weekly stamp 不应立刻到期"
+    fail=1
+  fi
+  printf '%s\n' "$(( $(date +%s) - 700000 ))" > "${WATCHDOG_WEEKLY_STAMP}"
+  if ! watchdog_weekly_due; then
+    err "超过 7 天应判定 weekly due"
+    fail=1
+  fi
+
+  printf '%s\n' '{"reality":[],"hysteria":[],"vless_ws":[],"vless":[],"vmess":[],"trojan":[],"shadowsocks":[],"wireguard":[],"http":[],"socks":[],"tunnel":[],"settings":'"${XCC_SETTINGS_DEFAULT}"'}' > "${work}/empty.json"
+  cp "${work}/empty.json" "${XCC_NODES}"
+  printf 'DIRECT\n' > "${XCC_OUTBOUND}"
+  if ! build_xray_config_json "${work}/xray-empty.json"; then
+    err "空节点配置生成失败"
+    fail=1
+  else
+    jq -e '[.outbounds[].tag] | (index("z_direct_outbound") != null) and (index("IPv4_out") != null) and (index("IPv6_out") != null) and (index("blackhole_out") != null)' \
+      "${work}/xray-empty.json" >/dev/null || { err "空配置也必须带齐出站条目"; fail=1; }
+  fi
+
+  # 旧节点迁移补 xray_port（用带 Reality 的原始 fixture，不要用空 nodes）
+  printf '%s\n' '{"reality":[{"tag":"reality-443","enabled":true,"port":443,"uuid":"u","sni":"download-installer.cdn.mozilla.net"}],"hysteria":[],"vless_ws":[],"vless":[],"vmess":[],"trojan":[],"shadowsocks":[],"wireguard":[],"http":[],"socks":[],"tunnel":[],"settings":{}}' > "${XCC_NODES}"
+  jq '.reality += [{"tag":"reality-8443","enabled":true,"port":8443,"uuid":"u","sni":"addons.mozilla.org"}]' \
+    "${XCC_NODES}" > "${work}/old.json"
+  cp "${work}/old.json" "${XCC_NODES}"
+  migrate_nodes_json
+  jq -e '.reality[0].xray_port==45987 and .reality[1].xray_port==45986 and .reality[1].short_id=="6ba85179e30d4fc2"' \
+    "${XCC_NODES}" >/dev/null || { err "migrate 未补齐 Reality xray_port / shortId"; fail=1; }
+
+  rm -rf "${work}"
+  if [[ "${fail}" -ne 0 ]]; then
+    err "xcc selftest 失败"
+    return 1
+  fi
+  info "xcc selftest 通过（Reality 双层入站 / 出站条目 / 路由 / 分享链接 / 迁移）"
+  return 0
 }
 
 cmd_run() {
@@ -3881,7 +5603,7 @@ cmd_run() {
   ensure_environment
   check_remote_xcc_version
   show_startup_warnings
-  if [[ -f "${WATCHDOG_HALT}" ]]; then
+  if [[ -f "${WATCHDOG_HALT}" || -f "${WATCHDOG_HALT_SB}" || -f "${WATCHDOG_HALT_NGINX}" ]]; then
     tui_msg "看门狗保护" "检测到 5 分钟内重启超过 3 次，自动重启已停止。主菜单可选择重置。"
   fi
   main_menu
@@ -3893,7 +5615,7 @@ cmd_version() {
 
 usage() {
   cat <<EOF
-xcc ${XCC_VERSION} - Xray / sing-box / Nginx 节点管理工具（仅支持单用户配置）
+xcc ${XCC_VERSION} - Xray / sing-box / Nginx 节点管理（3X-UI 入站覆盖，仅支持单用户）
 
 Usage:
   xcc              显示本帮助
@@ -3903,6 +5625,7 @@ Usage:
   xcc uninstall    卸载 xcc（需输入 yes 确认）
   xcc version      显示版本
   xcc watchdog     看门狗（由 systemd 调用，请勿手动前台运行）
+  xcc selftest     离线自检（Reality / 出站 / 路由 / 分享链接）
 
 安装（国内建议用 jsDelivr，避免 raw.githubusercontent.com DNS 污染）:
   bash <(curl -fsSL https://cdn.jsdelivr.net/gh/${XCC_GITHUB_SLUG}@${XCC_GITHUB_BRANCH}/install.sh)
@@ -3920,6 +5643,7 @@ main() {
     uninstall) cmd_uninstall ;;
     version|--version) cmd_version ;;
     watchdog) cmd_watchdog ;;
+    selftest) cmd_selftest; exit $? ;;
     *)
       err "未知命令: ${cmd}"
       usage
